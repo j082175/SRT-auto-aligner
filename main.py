@@ -44,6 +44,8 @@ class App(tk.Tk):
         self._output_path = tk.StringVar()
         self._language = tk.StringVar(value="자동 감지")
         self._model_size = tk.StringVar(value="large-v3")
+        self._split_enabled = tk.BooleanVar(value=True)
+        self._max_chars = tk.IntVar(value=42)
         self._log_queue: queue.Queue = queue.Queue()
         self._running = False
         self._start_time: float = 0.0
@@ -105,6 +107,28 @@ class App(tk.Tk):
         )
         lang_cb.grid(row=7, column=1, sticky="w", padx=(0, 6), pady=5)
 
+        # 긴 자막 분할
+        split_frame = tk.Frame(self, bg=BG)
+        split_frame.grid(row=8, column=0, columnspan=3, padx=18, pady=(0, 4), sticky="w")
+
+        tk.Checkbutton(
+            split_frame, text="긴 자막 자동 분할",
+            variable=self._split_enabled,
+            font=FONT_BOLD, bg=BG, fg=FG,
+            selectcolor=BG2, activebackground=BG, activeforeground=ACCENT,
+            command=self._on_split_toggle,
+        ).pack(side="left")
+
+        tk.Label(split_frame, text="최대", font=FONT, bg=BG, fg=FG2).pack(side="left", padx=(16, 4))
+        self._chars_spin = tk.Spinbox(
+            split_frame, textvariable=self._max_chars,
+            from_=20, to=120, increment=1, width=4,
+            font=FONT, bg=BG2, fg=FG, buttonbackground=BG2,
+            relief="flat", highlightthickness=0,
+        )
+        self._chars_spin.pack(side="left")
+        tk.Label(split_frame, text="자", font=FONT, bg=BG, fg=FG2).pack(side="left", padx=(4, 0))
+
         # 실행 버튼
         self._run_btn = tk.Button(
             self, text="시작", font=FONT_BOLD,
@@ -113,11 +137,11 @@ class App(tk.Tk):
             relief="flat", cursor="hand2", padx=28, pady=8,
             command=self._start,
         )
-        self._run_btn.grid(row=8, column=0, columnspan=3, pady=(10, 6))
+        self._run_btn.grid(row=9, column=0, columnspan=3, pady=(10, 6))
 
         # 진행 바 + 경과 시간
         bottom_frame = tk.Frame(self, bg=BG)
-        bottom_frame.grid(row=9, column=0, columnspan=3, padx=18, pady=(0, 6), sticky="ew")
+        bottom_frame.grid(row=10, column=0, columnspan=3, padx=18, pady=(0, 6), sticky="ew")
 
         style = ttk.Style()
         style.theme_use("clam")
@@ -137,7 +161,7 @@ class App(tk.Tk):
 
         # 로그 창
         log_frame = tk.Frame(self, bg=BG2)
-        log_frame.grid(row=10, column=0, columnspan=3, padx=18, pady=(0, 18), sticky="nsew")
+        log_frame.grid(row=11, column=0, columnspan=3, padx=18, pady=(0, 18), sticky="nsew")
         self._log_text = tk.Text(
             log_frame, height=12, width=62, font=FONT_LOG,
             bg=BG2, fg=FG, insertbackground=FG,
@@ -171,6 +195,10 @@ class App(tk.Tk):
                         selectforeground="#ffffff", arrowcolor=FG2)
 
     # ── 모드 전환 ─────────────────────────────────────────────────────────────
+
+    def _on_split_toggle(self):
+        state = "normal" if self._split_enabled.get() else "disabled"
+        self._chars_spin.config(state=state)
 
     def _on_mode_change(self):
         is_generate = self._mode.get() == MODE_GENERATE
@@ -254,18 +282,20 @@ class App(tk.Tk):
         self._tick_timer()
         self._clear_log()
 
+        max_chars = self._max_chars.get() if self._split_enabled.get() else 0
+
         if self._mode.get() == MODE_GENERATE:
             thread = threading.Thread(
                 target=self._run_generate,
                 args=(self._media_path.get(), self._output_path.get(),
-                      lang_code, self._model_size.get()),
+                      lang_code, self._model_size.get(), max_chars),
                 daemon=True,
             )
         else:
             thread = threading.Thread(
                 target=self._run_align,
                 args=(self._media_path.get(), self._srt_path.get(),
-                      self._output_path.get(), lang_code),
+                      self._output_path.get(), lang_code, max_chars),
                 daemon=True,
             )
 
@@ -283,13 +313,14 @@ class App(tk.Tk):
 
         return confirm
 
-    def _run_generate(self, media, output, lang_code, model_size):
+    def _run_generate(self, media, output, lang_code, model_size, max_chars):
         try:
             transcribe_and_align(
                 media_path=media,
                 output_srt_path=output,
                 language_code=lang_code,
                 model_size=model_size,
+                max_chars=max_chars,
                 log=lambda msg: self._log_queue.put(("normal", msg)),
                 progress=lambda v: self._log_queue.put(("__progress__", v)),
                 confirm_overwrite=self._make_confirm_overwrite(),
@@ -300,13 +331,14 @@ class App(tk.Tk):
         finally:
             self._log_queue.put(("__done__", ""))
 
-    def _run_align(self, media, srt, output, lang_code):
+    def _run_align(self, media, srt, output, lang_code, max_chars):
         try:
             align_srt(
                 media_path=media,
                 srt_path=srt,
                 output_srt_path=output,
                 language_code=lang_code,
+                max_chars=max_chars,
                 log=lambda msg: self._log_queue.put(("normal", msg)),
                 progress=lambda v: self._log_queue.put(("__progress__", v)),
                 confirm_overwrite=self._make_confirm_overwrite(),

@@ -4,10 +4,11 @@ WhisperX 기반 자막 생성 및 재정렬 모듈.
 모드 1 - 생성+정렬: 영상 → Whisper 전사 → wav2vec2 alignment → SRT
 모드 2 - 정렬만:   영상 + 기존 SRT → wav2vec2 alignment → SRT
 
-출력 파일명: {기본경로}_{언어코드}.srt  (예: movie_ko.srt)
+출력 파일명: {기본경로}.{언어코드}.srt  (예: movie.ko.srt)
 """
 
 import os
+import re
 import tempfile
 from typing import Callable, List, Optional
 
@@ -44,9 +45,9 @@ def get_compute_type(device: str) -> str:
 
 
 def build_output_path(base_srt_path: str, lang_code: str) -> str:
-    """'{경로}/{파일명}.srt' → '{경로}/{파일명}_{lang}.srt'"""
+    """'{경로}/{파일명}.srt' → '{경로}/{파일명}.{lang}.srt'"""
     root, ext = os.path.splitext(base_srt_path)
-    return f"{root}_{lang_code}{ext}"
+    return f"{root}.{lang_code}{ext}"
 
 
 def extract_audio(input_path: str, output_wav: str) -> None:
@@ -58,6 +59,99 @@ def extract_audio(input_path: str, output_wav: str) -> None:
         .overwrite_output()
         .run(quiet=True)
     )
+
+
+def split_long_segments(
+    aligned_segments: List[dict],
+    max_chars: int = 42,
+) -> List[dict]:
+    """
+    긴 세그먼트를 word 타임스탬프 기준으로 분할.
+    word 타임스탬프가 없으면 글자 수 비례로 시간 배분.
+
+    Args:
+        aligned_segments: whisperx align() 결과 segments
+        max_chars: 세그먼트당 최대 글자 수
+    """
+    result = []
+    for seg in aligned_segments:
+        text = seg.get("text", "").strip()
+        seg_start = seg.get("start")
+        seg_end = seg.get("end")
+
+        if seg_start is None or seg_end is None or len(text) <= max_chars:
+            result.append(seg)
+            continue
+
+        words = [w for w in seg.get("words", []) if w.get("start") is not None]
+
+        if words:
+            # ── word 타임스탬프 기준 분할 ──────────────────────────────
+            chunks: List[dict] = []
+            cur_words: List[dict] = []
+            cur_text = ""
+
+            for word in words:
+                w_text = word.get("word", "")
+                candidate = (cur_text + w_text).strip()
+
+                if cur_text and len(candidate) > max_chars:
+                    chunks.append({
+                        "start": cur_words[0]["start"],
+                        "end": cur_words[-1].get("end", cur_words[-1]["start"] + 0.3),
+                        "text": cur_text.strip(),
+                        "words": cur_words,
+                    })
+                    cur_words = [word]
+                    cur_text = w_text
+                else:
+                    cur_words.append(word)
+                    cur_text += w_text
+
+            if cur_words:
+                chunks.append({
+                    "start": cur_words[0]["start"],
+                    "end": seg_end,
+                    "text": cur_text.strip(),
+                    "words": cur_words,
+                })
+
+            result.extend(chunks if chunks else [seg])
+
+        else:
+            # ── word 타임스탬프 없음 → 문장 부호 기준 + 글자 수 비례 분할 ──
+            parts = re.split(r'(?<=[.!?,])\s+', text)
+            chunks_text: List[str] = []
+            cur = ""
+            for part in parts:
+                candidate = (cur + " " + part).strip() if cur else part
+                if cur and len(candidate) > max_chars:
+                    chunks_text.append(cur)
+                    cur = part
+                else:
+                    cur = candidate
+            if cur:
+                chunks_text.append(cur)
+
+            if len(chunks_text) <= 1:
+                result.append(seg)
+                continue
+
+            total_chars = sum(len(c) for c in chunks_text)
+            duration = seg_end - seg_start
+            cur_start = seg_start
+            for i, chunk_text in enumerate(chunks_text):
+                ratio = len(chunk_text) / total_chars
+                chunk_end = (cur_start + duration * ratio) if i < len(chunks_text) - 1 else seg_end
+                result.append({
+                    "start": cur_start,
+                    "end": chunk_end,
+                    "text": chunk_text,
+                    "words": [],
+                })
+                cur_start = chunk_end
+
+    return result
 
 
 def _wx_segments_to_srt(wx_segments: List[dict]) -> List[SRTSegment]:
@@ -117,13 +211,17 @@ def transcribe_and_align(
     output_srt_path: str,
     language_code: Optional[str] = None,
     model_size: str = "large-v3",
+    max_chars: int = 0,
     log: Callable[[str], None] = print,
     progress: Callable[[int], None] = lambda _: None,
     confirm_overwrite: Callable[[str], bool] = lambda _: True,
 ) -> None:
     """
     모드 1: 자막 생성 + 정렬을 한 번에 처리.
-    출력: {output_srt_path 기본명}_{언어코드}.srt
+    출력: {output_srt_path 기본명}.{언어코드}.srt
+
+    Args:
+        max_chars: 세그먼트 최대 글자 수 (0이면 분할 안 함)
     """
     device = get_device()
     compute_type = get_compute_type(device)
@@ -165,9 +263,14 @@ def transcribe_and_align(
             return_char_alignments=False,
         )
         log("정렬 완료.")
-        progress(95)
+        progress(90)
 
-        segments = _wx_segments_to_srt(aligned["segments"])
+        out_segments = aligned["segments"]
+        if max_chars > 0:
+            log(f"긴 자막 분할 중 (최대 {max_chars}자)...")
+            out_segments = split_long_segments(out_segments, max_chars)
+
+        segments = _wx_segments_to_srt(out_segments)
         if not segments:
             raise RuntimeError("생성된 자막이 없습니다.")
 
@@ -190,13 +293,17 @@ def align_srt(
     srt_path: str,
     output_srt_path: str,
     language_code: Optional[str] = None,
+    max_chars: int = 0,
     log: Callable[[str], None] = print,
     progress: Callable[[int], None] = lambda _: None,
     confirm_overwrite: Callable[[str], bool] = lambda _: True,
 ) -> None:
     """
     모드 2: 기존 SRT의 타임스탬프만 재정렬.
-    출력: {output_srt_path 기본명}_{언어코드}.srt
+    출력: {output_srt_path 기본명}.{언어코드}.srt
+
+    Args:
+        max_chars: 세그먼트 최대 글자 수 (0이면 분할 안 함)
     """
     device = get_device()
     log(f"장치: {device.upper()}")
@@ -247,10 +354,16 @@ def align_srt(
             return_char_alignments=False,
         )
         log("재정렬 완료.")
-        progress(90)
+        progress(88)
 
-        log("원본 자막 길이 보존 적용 중...")
-        new_segments = _merge_with_original_duration(aligned["segments"], srt_segments)
+        out_segments = aligned["segments"]
+        if max_chars > 0:
+            log(f"긴 자막 분할 중 (최대 {max_chars}자)...")
+            out_segments = split_long_segments(out_segments, max_chars)
+            new_segments = _wx_segments_to_srt(out_segments)
+        else:
+            log("원본 자막 길이 보존 적용 중...")
+            new_segments = _merge_with_original_duration(out_segments, srt_segments)
 
         final_path = build_output_path(output_srt_path, language_code)
         if os.path.exists(final_path) and not confirm_overwrite(final_path):
