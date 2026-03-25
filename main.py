@@ -14,6 +14,12 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from typing import Callable
 
+try:
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+    _DND_AVAILABLE = True
+except ImportError:
+    _DND_AVAILABLE = False
+
 from aligner import LANGUAGE_OPTIONS, MODEL_OPTIONS, align_srt, build_output_path, transcribe_and_align
 
 # ── 색상/폰트 상수 ────────────────────────────────────────────────────────────
@@ -34,7 +40,7 @@ MODE_GENERATE = "생성 + 정렬"
 MODE_ALIGN = "정렬만"
 
 
-class App(tk.Tk):
+class App(TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("SRT 자동 정렬기")
@@ -44,7 +50,7 @@ class App(tk.Tk):
         self._mode = tk.StringVar(value=MODE_GENERATE)
         self._media_path = tk.StringVar()
         self._srt_path = tk.StringVar()
-        self._output_path = tk.StringVar()
+        self._output_folder = tk.StringVar()
         self._language = tk.StringVar(value="자동 감지")
         self._model_size = tk.StringVar(value="large-v3")
         self._split_enabled = tk.BooleanVar(value=True)
@@ -87,9 +93,11 @@ class App(tk.Tk):
             ).pack(side="left", padx=16)
 
         # 파일 입력
-        self._file_row("영상 / 오디오", self._media_path, self._browse_media, 3)
-        self._srt_widgets = self._file_row("입력 SRT", self._srt_path, self._browse_srt, 4, return_widgets=True)
-        self._file_row("출력 SRT", self._output_path, self._browse_output, 5)
+        self._file_row("영상 / 오디오", self._media_path, self._browse_media, 3,
+                       accept_drop=[".mp4", ".mkv", ".avi", ".mov", ".mp3", ".wav", ".flac", ".m4a", ".aac"])
+        self._srt_widgets = self._file_row("입력 SRT", self._srt_path, self._browse_srt, 4,
+                                           return_widgets=True, accept_drop=[".srt"])
+        self._file_row("출력 폴더", self._output_folder, self._browse_output, 5)
 
         # 모델 선택 (생성+정렬 모드에서만 표시)
         self._model_label = tk.Label(self, text="Whisper 모델", font=FONT_BOLD, bg=BG, fg=FG2, anchor="w", width=14)
@@ -183,18 +191,37 @@ class App(tk.Tk):
         self._log_text.tag_configure("error", foreground=ERROR)
         self._log_text.tag_configure("normal", foreground=FG)
 
-    def _file_row(self, label, var, browse_cmd, row, return_widgets=False):
+    def _file_row(self, label, var, browse_cmd, row, return_widgets=False, accept_drop=None):
         lbl = tk.Label(self, text=label, font=FONT_BOLD, bg=BG, fg=FG2, anchor="w", width=14)
         lbl.grid(row=row, column=0, sticky="w", padx=18, pady=5)
         entry = tk.Entry(self, textvariable=var, font=FONT, bg=BG2, fg=FG,
                          insertbackground=FG, relief="flat", width=36)
         entry.grid(row=row, column=1, padx=(0, 6), pady=5)
+        if _DND_AVAILABLE and accept_drop is not None:
+            entry.drop_target_register(DND_FILES)
+            entry.dnd_bind("<<Drop>>", lambda e: self._on_drop(e, var, accept_drop))
         btn = tk.Button(self, text="찾아보기", font=FONT, bg=BG2, fg=FG,
                         activebackground=ACCENT, activeforeground="#ffffff",
                         relief="flat", cursor="hand2", padx=8, command=browse_cmd)
         btn.grid(row=row, column=2, padx=(0, 18), pady=5)
         if return_widgets:
             return lbl, entry, btn
+
+    def _on_drop(self, event, var, accept_exts):
+        # tkinterdnd2는 경로에 공백 있으면 {}로 감쌈
+        raw = event.data.strip()
+        if raw.startswith("{") and raw.endswith("}"):
+            path = raw[1:-1]
+        else:
+            path = raw.split()[0]
+        ext = os.path.splitext(path)[1].lower()
+        if accept_exts and ext not in accept_exts:
+            messagebox.showwarning("파일 형식 오류", f"지원하지 않는 파일 형식입니다: {ext}")
+            return
+        var.set(path)
+        # 출력 폴더 자동 설정
+        if var in (self._media_path, self._srt_path) and not self._output_folder.get():
+            self._output_folder.set(os.path.dirname(path))
 
     def _style_combobox(self):
         style = ttk.Style()
@@ -239,9 +266,8 @@ class App(tk.Tk):
         )
         if path:
             self._media_path.set(path)
-            if not self._output_path.get():
-                base, _ = os.path.splitext(path)
-                self._output_path.set(base + ".srt")
+            if not self._output_folder.get():
+                self._output_folder.set(os.path.dirname(path))
 
     def _browse_srt(self):
         path = filedialog.askopenfilename(
@@ -250,18 +276,13 @@ class App(tk.Tk):
         )
         if path:
             self._srt_path.set(path)
-            if not self._output_path.get():
-                base, _ = os.path.splitext(path)
-                self._output_path.set(base + ".srt")
+            if not self._output_folder.get():
+                self._output_folder.set(os.path.dirname(path))
 
     def _browse_output(self):
-        path = filedialog.asksaveasfilename(
-            title="출력 SRT 저장 위치",
-            defaultextension=".srt",
-            filetypes=[("SRT 자막", "*.srt")],
-        )
-        if path:
-            self._output_path.set(path)
+        folder = filedialog.askdirectory(title="출력 폴더 선택")
+        if folder:
+            self._output_folder.set(folder)
 
     # ── 실행 로직 ─────────────────────────────────────────────────────────────
 
@@ -273,8 +294,8 @@ class App(tk.Tk):
             if not self._srt_path.get() or not os.path.isfile(self._srt_path.get()):
                 messagebox.showerror("오류", "입력 SRT 파일을 선택하세요.")
                 return False
-        if not self._output_path.get():
-            messagebox.showerror("오류", "출력 SRT 경로를 지정하세요.")
+        if not self._output_folder.get() or not os.path.isdir(self._output_folder.get()):
+            messagebox.showerror("오류", "출력 폴더를 지정하세요.")
             return False
         return True
 
@@ -286,7 +307,9 @@ class App(tk.Tk):
 
         # 언어가 명시적으로 선택된 경우 출력 경로를 미리 계산해서 덮어쓰기 확인
         if lang_code is not None:
-            preview_path = build_output_path(self._output_path.get(), lang_code)
+            preview_path = build_output_path(
+                self._output_folder.get(), self._media_path.get(), lang_code
+            )
             if os.path.exists(preview_path):
                 if not messagebox.askyesno(
                     "파일 덮어쓰기",
@@ -306,7 +329,7 @@ class App(tk.Tk):
         if self._mode.get() == MODE_GENERATE:
             thread = threading.Thread(
                 target=self._run_generate,
-                args=(self._media_path.get(), self._output_path.get(),
+                args=(self._media_path.get(), self._output_folder.get(),
                       lang_code, self._model_size.get(), max_chars),
                 daemon=True,
             )
@@ -314,7 +337,7 @@ class App(tk.Tk):
             thread = threading.Thread(
                 target=self._run_align,
                 args=(self._media_path.get(), self._srt_path.get(),
-                      self._output_path.get(), lang_code, max_chars),
+                      self._output_folder.get(), lang_code, max_chars),
                 daemon=True,
             )
 
@@ -332,11 +355,11 @@ class App(tk.Tk):
 
         return confirm
 
-    def _run_generate(self, media, output, lang_code, model_size, max_chars):
+    def _run_generate(self, media, output_folder, lang_code, model_size, max_chars):
         try:
             transcribe_and_align(
                 media_path=media,
-                output_srt_path=output,
+                output_folder=output_folder,
                 language_code=lang_code,
                 model_size=model_size,
                 max_chars=max_chars,
@@ -350,12 +373,12 @@ class App(tk.Tk):
         finally:
             self._log_queue.put(("__done__", ""))
 
-    def _run_align(self, media, srt, output, lang_code, max_chars):
+    def _run_align(self, media, srt, output_folder, lang_code, max_chars):
         try:
             align_srt(
                 media_path=media,
                 srt_path=srt,
-                output_srt_path=output,
+                output_folder=output_folder,
                 language_code=lang_code,
                 max_chars=max_chars,
                 log=lambda msg: self._log_queue.put(("normal", msg)),

@@ -66,9 +66,13 @@ def get_compute_type(device: str) -> str:
     return "float16" if device == "cuda" else "float32"
 
 
-def build_output_path(base_srt_path: str, lang_code: str) -> str:
-    root, ext = os.path.splitext(base_srt_path)
-    return f"{root}.{lang_code}{ext}"
+def build_output_path(output_folder: str, input_path: str, lang_code: str) -> str:
+    """출력 폴더 + 입력 파일명 + 언어코드로 최종 SRT 경로 생성.
+
+    예: ('/Videos', '/Movies/movie.mp4', 'en') → '/Videos/movie.en.srt'
+    """
+    basename = os.path.splitext(os.path.basename(input_path))[0]
+    return os.path.join(output_folder, f"{basename}.{lang_code}.srt")
 
 
 def extract_audio(input_path: str, output_wav: str) -> None:
@@ -376,7 +380,7 @@ def _merge_with_original_duration(
 
 def transcribe_and_align(
     media_path: str,
-    output_srt_path: str,
+    output_folder: str,
     language_code: Optional[str] = None,
     model_size: str = "large-v3",
     max_chars: int = 0,
@@ -436,7 +440,7 @@ def transcribe_and_align(
         if not segments:
             raise RuntimeError("생성된 자막이 없습니다.")
 
-        final_path = build_output_path(output_srt_path, detected_lang)
+        final_path = build_output_path(output_folder, media_path, detected_lang)
         # 자동 감지인 경우에만 후확인 (명시 선택 시 시작 전 이미 확인)
         if language_code is None and os.path.exists(final_path) and not confirm_overwrite(final_path):
             log("취소되었습니다.")
@@ -454,7 +458,7 @@ def transcribe_and_align(
 def align_srt(
     media_path: str,
     srt_path: str,
-    output_srt_path: str,
+    output_folder: str,
     language_code: Optional[str] = None,
     max_chars: int = 0,
     log: Callable[[str], None] = print,
@@ -522,7 +526,7 @@ def align_srt(
             log("원본 자막 길이 보존 적용 중...")
             new_segments = _merge_with_original_duration(out_segments, srt_segments)
 
-        final_path = build_output_path(output_srt_path, language_code)
+        final_path = build_output_path(output_folder, media_path, language_code)
         # 자동 감지인 경우에만 후확인 (명시 선택 시 시작 전 이미 확인)
         if language_code is None and os.path.exists(final_path) and not confirm_overwrite(final_path):
             log("취소되었습니다.")

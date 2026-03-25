@@ -3,3 +3,4 @@ torch
 torchaudio
 ffmpeg-python
 spacy
+tkinterdnd2
