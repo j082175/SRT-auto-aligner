@@ -150,9 +150,14 @@ class App(tk.Tk):
                         bordercolor=BG, lightcolor=ACCENT, darkcolor=ACCENT)
         self._progress = ttk.Progressbar(
             bottom_frame, style="custom.Horizontal.TProgressbar",
-            mode="determinate", length=340, maximum=100,
+            mode="determinate", length=300, maximum=100,
         )
         self._progress.pack(side="left")
+
+        self._percent_label = tk.Label(
+            bottom_frame, text="", font=FONT, bg=BG, fg=ACCENT, width=5, anchor="w"
+        )
+        self._percent_label.pack(side="left", padx=(6, 0))
 
         self._timer_label = tk.Label(
             bottom_frame, text="", font=FONT, bg=BG, fg=FG2, width=8, anchor="e"
@@ -371,10 +376,12 @@ class App(tk.Tk):
                     elapsed = int(time.time() - self._start_time)
                     m, s = divmod(elapsed, 60)
                     self._timer_label.config(text=f"{m:02d}:{s:02d}")
+                    self._percent_label.config(text="")
                     self._run_btn.config(state="normal", text="시작")
                     self._running = False
                 elif tag == "__progress__":
                     self._progress["value"] = msg
+                    self._percent_label.config(text=f"{int(msg)}%")
                 elif tag == "__ask_overwrite__":
                     path, event, result = msg
                     answer = messagebox.askyesno(
