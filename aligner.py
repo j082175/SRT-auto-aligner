@@ -61,12 +61,57 @@ def extract_audio(input_path: str, output_wav: str) -> None:
     )
 
 
+# 줄 끝에 혼자 남으면 어색한 단어들 (관사, 전치사, 접속사 등)
+_DANGLING_WORDS = {
+    "a", "an", "the",
+    "of", "in", "on", "at", "to", "for", "by", "up", "as",
+    "or", "and", "but", "nor", "so", "yet",
+    "if", "not", "no",
+}
+
+
+def _fix_dangling(chunks: List[dict]) -> List[dict]:
+    """
+    청크 끝 단어가 관사/전치사/접속사면 다음 청크 앞으로 이동.
+    word 리스트가 있는 청크에만 적용.
+    """
+    if len(chunks) < 2:
+        return chunks
+
+    result = [dict(c) for c in chunks]  # shallow copy
+
+    for i in range(len(result) - 1):
+        cur_words = result[i].get("words", [])
+        if not cur_words:
+            continue
+
+        last_word = cur_words[-1].get("word", "").strip().rstrip(".,!?")
+        if last_word.lower() not in _DANGLING_WORDS:
+            continue
+
+        # 마지막 단어를 다음 청크로 이동
+        move_word = cur_words[-1]
+        next_words = [move_word] + result[i + 1].get("words", [])
+
+        result[i]["words"] = cur_words[:-1]
+        result[i]["text"] = " ".join(w.get("word", "").strip() for w in result[i]["words"])
+        result[i]["end"] = cur_words[-2].get("end", result[i]["end"]) if len(cur_words) > 1 else result[i]["start"]
+
+        result[i + 1]["words"] = next_words
+        result[i + 1]["text"] = " ".join(w.get("word", "").strip() for w in next_words)
+        result[i + 1]["start"] = move_word.get("start", result[i + 1]["start"])
+
+    # 빈 청크 제거
+    return [c for c in result if c.get("text", "").strip()]
+
+
 def split_long_segments(
     aligned_segments: List[dict],
     max_chars: int = 42,
 ) -> List[dict]:
     """
     긴 세그먼트를 word 타임스탬프 기준으로 분할.
+    분할 후 관사/전치사가 줄 끝에 고립되면 다음 줄로 이동.
     word 타임스탬프가 없으면 글자 수 비례로 시간 배분.
 
     Args:
@@ -119,7 +164,7 @@ def split_long_segments(
                     "words": cur_words,
                 })
 
-            result.extend(chunks if chunks else [seg])
+            result.extend(_fix_dangling(chunks) if chunks else [seg])
 
         else:
             # ── word 타임스탬프 없음 → 문장 부호 기준 + 글자 수 비례 분할 ──
