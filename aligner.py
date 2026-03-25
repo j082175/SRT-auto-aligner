@@ -181,14 +181,21 @@ def _split_words_smart(
         else:
             overflow_idx = len(words)
 
-        # 역방향으로 안전한 cut point 탐색
+        # 1순위: 역방향으로 콤마 위치 탐색
         cut_idx = None
         for i in range(overflow_idx - 1, start_idx, -1):
-            if _is_safe_cut(char_ends[i], noun_spans):
+            if word_texts[i].rstrip().endswith(","):
                 cut_idx = i
                 break
 
-        # 정방향 탐색
+        # 2순위: 역방향으로 spaCy 명사구 경계 탐색
+        if cut_idx is None:
+            for i in range(overflow_idx - 1, start_idx, -1):
+                if _is_safe_cut(char_ends[i], noun_spans):
+                    cut_idx = i
+                    break
+
+        # 3순위: 정방향 탐색
         if cut_idx is None:
             for i in range(overflow_idx, len(words)):
                 if _is_safe_cut(char_ends[i], noun_spans):
