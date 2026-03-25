@@ -4,3 +4,4 @@ torchaudio
 ffmpeg-python
 spacy
 tkinterdnd2
+num2words

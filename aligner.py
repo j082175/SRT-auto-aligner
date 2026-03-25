@@ -15,8 +15,68 @@ from typing import Any, Callable, List, Optional
 import ffmpeg
 import torch
 import whisperx
+from num2words import num2words
 
 from srt_utils import SRTSegment, parse_srt, write_srt
+
+
+# 언어 코드 → num2words 언어 코드 매핑
+_NUM2WORDS_LANG = {
+    "en": "en", "ko": "ko", "ja": "ja", "zh": "zh",
+    "es": "es", "fr": "fr", "de": "de", "ru": "ru",
+    "pt": "pt", "it": "it", "ar": "ar",
+}
+
+
+def _expand_numbers(text: str, lang: str) -> tuple:
+    """텍스트 내 숫자를 해당 언어의 단어로 변환.
+
+    Returns:
+        (expanded_text, replacements) — replacements는 (원본숫자, 변환단어) 리스트
+    """
+    n2w_lang = _NUM2WORDS_LANG.get(lang, "en")
+    replacements = []
+
+    def replace(m):
+        num_str = m.group(0)
+        try:
+            n = int(num_str)
+            word = num2words(n, lang=n2w_lang)
+            replacements.append((word, num_str))
+            return word
+        except Exception:
+            return num_str
+
+    expanded = re.sub(r"\b\d+\b", replace, text)
+    return expanded, replacements
+
+
+def _collapse_numbers(text: str, replacements: list) -> str:
+    """_expand_numbers의 역변환: 변환된 단어(하이픈/공백 모두)를 원래 숫자로 되돌림."""
+    for word, orig in replacements:
+        # "twenty-two" 또는 "twenty two" 두 형태 모두 매칭
+        pattern = re.escape(word).replace(r"\-", r"[-\s]").replace(r"\ ", r"[-\s]")
+        text = re.sub(pattern, orig, text, flags=re.IGNORECASE)
+    return text
+
+
+def _restore_segments(aligned_segments: list, orig_texts: list, replacements_list: list) -> None:
+    """alignment 결과의 seg["text"]와 word["word"]를 원본으로 복원."""
+    for seg, orig, replacements in zip(aligned_segments, orig_texts, replacements_list):
+        seg["text"] = orig
+        for w in seg.get("words", []):
+            w["word"] = _collapse_numbers(w.get("word", ""), replacements)
+
+
+def collapse_numbers_in_srt(segments: List[SRTSegment], replacements_list: list) -> List[SRTSegment]:
+    """최종 SRT 세그먼트의 텍스트에서 숫자 단어를 원래 숫자로 복원 (split 후 잔여 처리)."""
+    # 모든 replacements를 하나로 합침
+    all_replacements = [r for reps in replacements_list for r in reps]
+    if not all_replacements:
+        return segments
+    for seg in segments:
+        seg.text = _collapse_numbers(seg.text, all_replacements)
+    return segments
 
 LANGUAGE_OPTIONS = {
     "자동 감지": None,
@@ -423,10 +483,18 @@ def transcribe_and_align(
         model_a, metadata = whisperx.load_align_model(language_code=detected_lang, device=device)
         log("자막 정렬 중...")
         progress(80)
+        # 숫자를 단어로 변환해 alignment 정확도 향상 (결과 텍스트는 원본으로 복원)
+        orig_texts = [seg.get("text", "") for seg in result["segments"]]
+        replacements_list = []
+        for seg in result["segments"]:
+            expanded, replacements = _expand_numbers(seg.get("text", ""), detected_lang)
+            seg["text"] = expanded
+            replacements_list.append(replacements)
         aligned = whisperx.align(
             result["segments"], model_a, metadata, audio, device,
             return_char_alignments=False,
         )
+        _restore_segments(aligned["segments"], orig_texts, replacements_list)
         log("정렬 완료.")
         progress(90)
 
@@ -437,6 +505,7 @@ def transcribe_and_align(
             out_segments = split_long_segments(out_segments, max_chars, nlp)
 
         segments = _wx_segments_to_srt(out_segments)
+        segments = collapse_numbers_in_srt(segments, replacements_list)
         if not segments:
             raise RuntimeError("생성된 자막이 없습니다.")
 
@@ -505,14 +574,18 @@ def align_srt(
 
         log("자막 재정렬 중...")
         progress(70)
-        wx_input = [
-            {"start": seg.start, "end": seg.end, "text": seg.text}
-            for seg in srt_segments
-        ]
+        orig_texts = [seg.text for seg in srt_segments]
+        replacements_list = []
+        wx_input = []
+        for seg in srt_segments:
+            expanded, replacements = _expand_numbers(seg.text, language_code)
+            wx_input.append({"start": seg.start, "end": seg.end, "text": expanded})
+            replacements_list.append(replacements)
         aligned = whisperx.align(
             wx_input, model_a, metadata, audio, device,
             return_char_alignments=False,
         )
+        _restore_segments(aligned["segments"], orig_texts, replacements_list)
         log("재정렬 완료.")
         progress(88)
 
@@ -525,6 +598,8 @@ def align_srt(
         else:
             log("원본 자막 길이 보존 적용 중...")
             new_segments = _merge_with_original_duration(out_segments, srt_segments)
+
+        new_segments = collapse_numbers_in_srt(new_segments, replacements_list)
 
         final_path = build_output_path(output_folder, media_path, language_code)
         # 자동 감지인 경우에만 후확인 (명시 선택 시 시작 전 이미 확인)
