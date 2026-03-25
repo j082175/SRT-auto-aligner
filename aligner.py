@@ -181,12 +181,14 @@ def _split_words_smart(
         else:
             overflow_idx = len(words)
 
-        # 1순위: 역방향으로 콤마 위치 탐색
+        # 1순위: 역방향으로 콤마 위치 탐색 (앞 청크가 최소 25자 이상일 때만)
         cut_idx = None
         for i in range(overflow_idx - 1, start_idx, -1):
             if word_texts[i].rstrip().endswith(","):
-                cut_idx = i
-                break
+                chunk_len = char_ends[i] - char_starts[start_idx]
+                if chunk_len >= 25:
+                    cut_idx = i
+                    break
 
         # 2순위: 역방향으로 spaCy 명사구 경계 탐색
         if cut_idx is None:
