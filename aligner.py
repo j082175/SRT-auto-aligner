@@ -89,30 +89,33 @@ def split_long_segments(
             # ── word 타임스탬프 기준 분할 ──────────────────────────────
             chunks: List[dict] = []
             cur_words: List[dict] = []
-            cur_text = ""
 
             for word in words:
-                w_text = word.get("word", "")
-                candidate = (cur_text + w_text).strip()
+                w_text = word.get("word", "").strip()
+                if not w_text:
+                    continue
 
-                if cur_text and len(candidate) > max_chars:
+                cur_text_preview = " ".join(
+                    w.get("word", "").strip() for w in cur_words
+                )
+                candidate = (cur_text_preview + " " + w_text).strip()
+
+                if cur_words and len(candidate) > max_chars:
                     chunks.append({
                         "start": cur_words[0]["start"],
                         "end": cur_words[-1].get("end", cur_words[-1]["start"] + 0.3),
-                        "text": cur_text.strip(),
+                        "text": cur_text_preview,
                         "words": cur_words,
                     })
                     cur_words = [word]
-                    cur_text = w_text
                 else:
                     cur_words.append(word)
-                    cur_text += w_text
 
             if cur_words:
                 chunks.append({
                     "start": cur_words[0]["start"],
                     "end": seg_end,
-                    "text": cur_text.strip(),
+                    "text": " ".join(w.get("word", "").strip() for w in cur_words),
                     "words": cur_words,
                 })
 
