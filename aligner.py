@@ -114,19 +114,40 @@ def _is_safe_cut(cut_char: int, noun_spans: List[tuple]) -> bool:
     return True
 
 
+def _first_timestamp(words: List[dict], key: str, fallback: float) -> float:
+    """words 중 key 타임스탬프가 있는 첫 번째 값 반환."""
+    for w in words:
+        v = w.get(key)
+        if v is not None:
+            return v
+    return fallback
+
+
+def _last_timestamp(words: List[dict], key: str, fallback: float) -> float:
+    """words 중 key 타임스탬프가 있는 마지막 값 반환."""
+    for w in reversed(words):
+        v = w.get(key)
+        if v is not None:
+            return v
+    return fallback
+
+
 def _split_words_smart(
     words: List[dict],
+    seg_start: float,
     seg_end: float,
     max_chars: int,
     noun_spans: List[tuple],
 ) -> List[dict]:
     """
     word 타임스탬프 기준 분할.
-    명사구 중간에서 자르지 않도록 cut point를 조정.
+    - 타임스탬프 없는 단어도 텍스트에 포함 (누락 방지)
+    - 명사구 중간에서 자르지 않도록 cut point 조정
+    - 중간 청크 end = 다음 청크 start (끊김 방지)
     """
     word_texts = [w.get("word", "").strip() for w in words]
 
-    # 각 단어의 문자 오프셋 계산 (joined text 기준)
+    # 각 단어의 문자 오프셋 계산
     char_starts: List[int] = []
     char_ends: List[int] = []
     pos = 0
@@ -139,19 +160,18 @@ def _split_words_smart(
     start_idx = 0
 
     while start_idx < len(words):
-        # 남은 텍스트가 max_chars 이하면 그냥 묶기
         remaining = " ".join(word_texts[start_idx:])
         if len(remaining) <= max_chars:
             chunk_words = words[start_idx:]
             chunks.append({
-                "start": chunk_words[0]["start"],
+                "start": _first_timestamp(chunk_words, "start", seg_start),
                 "end": seg_end,
                 "text": remaining,
                 "words": chunk_words,
             })
             break
 
-        # max_chars를 초과하는 첫 번째 단어 인덱스 찾기
+        # max_chars 초과 첫 번째 단어 인덱스
         overflow_idx = start_idx
         for i in range(start_idx, len(words)):
             chunk_len = char_ends[i] - char_starts[start_idx]
@@ -161,34 +181,35 @@ def _split_words_smart(
         else:
             overflow_idx = len(words)
 
-        # overflow_idx 직전부터 역방향으로 안전한 cut point 탐색
+        # 역방향으로 안전한 cut point 탐색
         cut_idx = None
         for i in range(overflow_idx - 1, start_idx, -1):
-            cut_char = char_ends[i]
-            if _is_safe_cut(cut_char, noun_spans):
+            if _is_safe_cut(char_ends[i], noun_spans):
                 cut_idx = i
                 break
 
-        # 역방향에서 못 찾으면 overflow_idx 이후 정방향 탐색
+        # 정방향 탐색
         if cut_idx is None:
             for i in range(overflow_idx, len(words)):
-                cut_char = char_ends[i]
-                if _is_safe_cut(cut_char, noun_spans):
+                if _is_safe_cut(char_ends[i], noun_spans):
                     cut_idx = i
                     break
 
-        # 그래도 없으면 그냥 overflow 직전에서 자름
         if cut_idx is None:
             cut_idx = max(overflow_idx - 1, start_idx)
 
         chunk_words = words[start_idx: cut_idx + 1]
         chunks.append({
-            "start": chunk_words[0]["start"],
-            "end": chunk_words[-1].get("end", chunk_words[-1]["start"] + 0.3),
+            "start": _first_timestamp(chunk_words, "start", seg_start),
+            "end": _last_timestamp(chunk_words, "end", seg_end),  # 임시, 아래서 보정
             "text": " ".join(word_texts[start_idx: cut_idx + 1]),
             "words": chunk_words,
         })
         start_idx = cut_idx + 1
+
+    # 중간 청크 end = 다음 청크 start (빈 구간 없애기)
+    for i in range(len(chunks) - 1):
+        chunks[i]["end"] = chunks[i + 1]["start"]
 
     return chunks
 
@@ -245,14 +266,16 @@ def split_long_segments(
             result.append(seg)
             continue
 
-        words = [w for w in seg.get("words", []) if w.get("start") is not None]
+        # 타임스탬프 없는 단어도 포함 (텍스트 누락 방지)
+        words = seg.get("words", [])
+        # 분할 기준으로 쓸 타임스탬프가 하나라도 있으면 word 기반 분할
+        has_timestamps = any(w.get("start") is not None for w in words)
 
-        if words:
-            # 명사구 spans 계산 (joined word text 기준)
+        if words and has_timestamps:
             joined = " ".join(w.get("word", "").strip() for w in words)
             noun_spans = _get_noun_chunk_spans(joined, nlp) if nlp else []
 
-            chunks = _split_words_smart(words, seg_end, max_chars, noun_spans)
+            chunks = _split_words_smart(words, seg_start, seg_end, max_chars, noun_spans)
             result.extend(_fix_dangling(chunks) if chunks else [seg])
 
         else:
