@@ -9,6 +9,7 @@ import threading
 import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
+from typing import Callable
 
 from aligner import LANGUAGE_OPTIONS, MODEL_OPTIONS, align_srt, transcribe_and_align
 
@@ -49,6 +50,7 @@ class App(tk.Tk):
         self._timer_after_id = None
 
         self._build_ui()
+        self._on_mode_change()
         self._poll_log()
 
     # ── UI 빌드 ───────────────────────────────────────────────────────────────
@@ -203,7 +205,7 @@ class App(tk.Tk):
             self._media_path.set(path)
             if not self._output_path.get():
                 base, _ = os.path.splitext(path)
-                self._output_path.set(base + "_aligned.srt")
+                self._output_path.set(base + ".srt")
 
     def _browse_srt(self):
         path = filedialog.askopenfilename(
@@ -214,7 +216,7 @@ class App(tk.Tk):
             self._srt_path.set(path)
             if not self._output_path.get():
                 base, _ = os.path.splitext(path)
-                self._output_path.set(base + "_aligned.srt")
+                self._output_path.set(base + ".srt")
 
     def _browse_output(self):
         path = filedialog.asksaveasfilename(
@@ -269,6 +271,18 @@ class App(tk.Tk):
 
         thread.start()
 
+    def _make_confirm_overwrite(self) -> Callable[[str], bool]:
+        """worker 스레드에서 main 스레드 덮어쓰기 다이얼로그를 호출하는 콜백."""
+        event = threading.Event()
+        result = [False]
+
+        def confirm(path: str) -> bool:
+            self._log_queue.put(("__ask_overwrite__", (path, event, result)))
+            event.wait()
+            return result[0]
+
+        return confirm
+
     def _run_generate(self, media, output, lang_code, model_size):
         try:
             transcribe_and_align(
@@ -278,6 +292,7 @@ class App(tk.Tk):
                 model_size=model_size,
                 log=lambda msg: self._log_queue.put(("normal", msg)),
                 progress=lambda v: self._log_queue.put(("__progress__", v)),
+                confirm_overwrite=self._make_confirm_overwrite(),
             )
             self._log_queue.put(("success", "✓ 완료! 파일이 저장되었습니다."))
         except Exception as e:
@@ -294,6 +309,7 @@ class App(tk.Tk):
                 language_code=lang_code,
                 log=lambda msg: self._log_queue.put(("normal", msg)),
                 progress=lambda v: self._log_queue.put(("__progress__", v)),
+                confirm_overwrite=self._make_confirm_overwrite(),
             )
             self._log_queue.put(("success", "✓ 완료! 파일이 저장되었습니다."))
         except Exception as e:
@@ -327,6 +343,14 @@ class App(tk.Tk):
                     self._running = False
                 elif tag == "__progress__":
                     self._progress["value"] = msg
+                elif tag == "__ask_overwrite__":
+                    path, event, result = msg
+                    answer = messagebox.askyesno(
+                        "파일 덮어쓰기",
+                        f"이미 존재하는 파일입니다:\n{path}\n\n덮어쓰겠습니까?",
+                    )
+                    result[0] = answer
+                    event.set()
                 else:
                     self._append_log(msg, tag)
         except queue.Empty:
