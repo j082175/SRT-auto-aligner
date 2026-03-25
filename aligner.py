@@ -52,7 +52,7 @@ _SPACY_MODELS = {
 # 줄 끝에 혼자 남으면 어색한 단어들
 _DANGLING_WORDS = {
     "a", "an", "the",
-    "of", "in", "on", "at", "to", "for", "by", "up", "as",
+    "of", "in", "on", "at", "to", "for", "by", "up", "as", "with",
     "or", "and", "but", "nor", "so", "yet",
     "if", "not", "no",
 }
