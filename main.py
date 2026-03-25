@@ -1,6 +1,6 @@
 """
 SRT 자동 정렬기 - GUI
-WhisperX (wav2vec2) 기반으로 자막 타임스탬프를 오디오에 맞춰 재정렬합니다.
+WhisperX 기반 자막 생성+정렬 / 기존 자막 재정렬
 """
 
 import os
@@ -9,7 +9,7 @@ import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-from aligner import LANGUAGE_OPTIONS, align_srt
+from aligner import LANGUAGE_OPTIONS, MODEL_OPTIONS, align_srt, transcribe_and_align
 
 # ── 색상/폰트 상수 ────────────────────────────────────────────────────────────
 BG = "#1e1e2e"
@@ -25,6 +25,9 @@ FONT_BOLD = ("Segoe UI", 10, "bold")
 FONT_TITLE = ("Segoe UI", 13, "bold")
 FONT_LOG = ("Consolas", 9)
 
+MODE_GENERATE = "생성 + 정렬"
+MODE_ALIGN = "정렬만"
+
 
 class App(tk.Tk):
     def __init__(self):
@@ -33,10 +36,12 @@ class App(tk.Tk):
         self.resizable(False, False)
         self.configure(bg=BG)
 
+        self._mode = tk.StringVar(value=MODE_GENERATE)
         self._media_path = tk.StringVar()
         self._srt_path = tk.StringVar()
         self._output_path = tk.StringVar()
         self._language = tk.StringVar(value="자동 감지")
+        self._model_size = tk.StringVar(value="large-v3")
         self._log_queue: queue.Queue = queue.Queue()
         self._running = False
 
@@ -46,144 +51,132 @@ class App(tk.Tk):
     # ── UI 빌드 ───────────────────────────────────────────────────────────────
 
     def _build_ui(self):
-        pad = {"padx": 18, "pady": 6}
-
         # 타이틀
-        tk.Label(
-            self,
-            text="SRT 자동 정렬기",
-            font=FONT_TITLE,
-            bg=BG,
-            fg=ACCENT,
-        ).grid(row=0, column=0, columnspan=3, pady=(18, 4))
+        tk.Label(self, text="SRT 자동 정렬기", font=FONT_TITLE, bg=BG, fg=ACCENT
+                 ).grid(row=0, column=0, columnspan=3, pady=(18, 4))
+        tk.Label(self, text="WhisperX(wav2vec2) 기반 자막 생성 및 싱크 정렬",
+                 font=("Segoe UI", 9), bg=BG, fg=FG2
+                 ).grid(row=1, column=0, columnspan=3, pady=(0, 10))
 
-        tk.Label(
-            self,
-            text="Whisper 자막의 싱크를 wav2vec2로 오디오에 맞춰 재정렬합니다.",
-            font=("Segoe UI", 9),
-            bg=BG,
-            fg=FG2,
-        ).grid(row=1, column=0, columnspan=3, pady=(0, 14))
+        # 모드 선택
+        mode_frame = tk.Frame(self, bg=BG)
+        mode_frame.grid(row=2, column=0, columnspan=3, pady=(0, 10))
+        for mode in [MODE_GENERATE, MODE_ALIGN]:
+            tk.Radiobutton(
+                mode_frame,
+                text=mode,
+                variable=self._mode,
+                value=mode,
+                font=FONT_BOLD,
+                bg=BG,
+                fg=FG,
+                selectcolor=BG2,
+                activebackground=BG,
+                activeforeground=ACCENT,
+                command=self._on_mode_change,
+            ).pack(side="left", padx=16)
 
-        # 파일 입력 영역
-        self._file_row("영상 / 오디오", self._media_path, self._browse_media, 2)
-        self._file_row("입력 SRT", self._srt_path, self._browse_srt, 3)
-        self._file_row("출력 SRT", self._output_path, self._browse_output, 4)
+        # 파일 입력
+        self._file_row("영상 / 오디오", self._media_path, self._browse_media, 3)
+        self._srt_widgets = self._file_row("입력 SRT", self._srt_path, self._browse_srt, 4, return_widgets=True)
+        self._file_row("출력 SRT", self._output_path, self._browse_output, 5)
+
+        # 모델 선택 (생성+정렬 모드에서만 표시)
+        self._model_label = tk.Label(self, text="Whisper 모델", font=FONT_BOLD, bg=BG, fg=FG2, anchor="w", width=14)
+        self._model_label.grid(row=6, column=0, sticky="w", padx=18, pady=5)
+        self._model_cb = ttk.Combobox(
+            self, textvariable=self._model_size,
+            values=MODEL_OPTIONS, state="readonly", font=FONT, width=16,
+        )
+        self._model_cb.grid(row=6, column=1, sticky="w", padx=(0, 6), pady=5)
+        self._style_combobox()
 
         # 언어 선택
-        tk.Label(self, text="언어", font=FONT_BOLD, bg=BG, fg=FG2, anchor="w", width=14).grid(
-            row=5, column=0, sticky="w", **pad
-        )
+        tk.Label(self, text="언어", font=FONT_BOLD, bg=BG, fg=FG2, anchor="w", width=14
+                 ).grid(row=7, column=0, sticky="w", padx=18, pady=5)
         lang_cb = ttk.Combobox(
-            self,
-            textvariable=self._language,
-            values=list(LANGUAGE_OPTIONS.keys()),
-            state="readonly",
-            font=FONT,
-            width=28,
+            self, textvariable=self._language,
+            values=list(LANGUAGE_OPTIONS.keys()), state="readonly", font=FONT, width=16,
         )
-        lang_cb.grid(row=5, column=1, sticky="w", **pad)
-        self._style_combobox(lang_cb)
+        lang_cb.grid(row=7, column=1, sticky="w", padx=(0, 6), pady=5)
 
         # 실행 버튼
         self._run_btn = tk.Button(
-            self,
-            text="정렬 시작",
-            font=FONT_BOLD,
-            bg=ACCENT,
-            fg="#ffffff",
-            activebackground=ACCENT_HOVER,
-            activeforeground="#ffffff",
-            relief="flat",
-            cursor="hand2",
-            padx=24,
-            pady=8,
+            self, text="시작", font=FONT_BOLD,
+            bg=ACCENT, fg="#ffffff",
+            activebackground=ACCENT_HOVER, activeforeground="#ffffff",
+            relief="flat", cursor="hand2", padx=28, pady=8,
             command=self._start,
         )
-        self._run_btn.grid(row=6, column=0, columnspan=3, pady=(10, 6))
+        self._run_btn.grid(row=8, column=0, columnspan=3, pady=(10, 6))
 
         # 진행 바
         style = ttk.Style()
         style.theme_use("clam")
-        style.configure(
-            "custom.Horizontal.TProgressbar",
-            troughcolor=BG2,
-            background=ACCENT,
-            bordercolor=BG,
-            lightcolor=ACCENT,
-            darkcolor=ACCENT,
-        )
+        style.configure("custom.Horizontal.TProgressbar",
+                        troughcolor=BG2, background=ACCENT,
+                        bordercolor=BG, lightcolor=ACCENT, darkcolor=ACCENT)
         self._progress = ttk.Progressbar(
-            self, style="custom.Horizontal.TProgressbar", mode="indeterminate", length=400
+            self, style="custom.Horizontal.TProgressbar",
+            mode="indeterminate", length=420,
         )
-        self._progress.grid(row=7, column=0, columnspan=3, padx=18, pady=(0, 6))
+        self._progress.grid(row=9, column=0, columnspan=3, padx=18, pady=(0, 6))
 
         # 로그 창
-        log_frame = tk.Frame(self, bg=BG2, bd=0)
-        log_frame.grid(row=8, column=0, columnspan=3, padx=18, pady=(0, 18), sticky="nsew")
-
+        log_frame = tk.Frame(self, bg=BG2)
+        log_frame.grid(row=10, column=0, columnspan=3, padx=18, pady=(0, 18), sticky="nsew")
         self._log_text = tk.Text(
-            log_frame,
-            height=12,
-            width=60,
-            font=FONT_LOG,
-            bg=BG2,
-            fg=FG,
-            insertbackground=FG,
-            relief="flat",
-            state="disabled",
-            wrap="word",
+            log_frame, height=12, width=62, font=FONT_LOG,
+            bg=BG2, fg=FG, insertbackground=FG,
+            relief="flat", state="disabled", wrap="word",
         )
-        scrollbar = tk.Scrollbar(log_frame, command=self._log_text.yview, bg=BG2)
-        self._log_text.configure(yscrollcommand=scrollbar.set)
-        scrollbar.pack(side="right", fill="y")
+        sb = tk.Scrollbar(log_frame, command=self._log_text.yview, bg=BG2)
+        self._log_text.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
         self._log_text.pack(side="left", fill="both", expand=True, padx=6, pady=6)
-
         self._log_text.tag_configure("success", foreground=SUCCESS)
         self._log_text.tag_configure("error", foreground=ERROR)
         self._log_text.tag_configure("normal", foreground=FG)
 
-    def _file_row(self, label: str, var: tk.StringVar, browse_cmd, row: int):
-        tk.Label(self, text=label, font=FONT_BOLD, bg=BG, fg=FG2, anchor="w", width=14).grid(
-            row=row, column=0, sticky="w", padx=18, pady=5
-        )
-        entry = tk.Entry(
-            self,
-            textvariable=var,
-            font=FONT,
-            bg=BG2,
-            fg=FG,
-            insertbackground=FG,
-            relief="flat",
-            width=36,
-        )
+    def _file_row(self, label, var, browse_cmd, row, return_widgets=False):
+        lbl = tk.Label(self, text=label, font=FONT_BOLD, bg=BG, fg=FG2, anchor="w", width=14)
+        lbl.grid(row=row, column=0, sticky="w", padx=18, pady=5)
+        entry = tk.Entry(self, textvariable=var, font=FONT, bg=BG2, fg=FG,
+                         insertbackground=FG, relief="flat", width=36)
         entry.grid(row=row, column=1, padx=(0, 6), pady=5)
-        tk.Button(
-            self,
-            text="찾아보기",
-            font=FONT,
-            bg=BG2,
-            fg=FG,
-            activebackground=ACCENT,
-            activeforeground="#ffffff",
-            relief="flat",
-            cursor="hand2",
-            padx=8,
-            command=browse_cmd,
-        ).grid(row=row, column=2, padx=(0, 18), pady=5)
+        btn = tk.Button(self, text="찾아보기", font=FONT, bg=BG2, fg=FG,
+                        activebackground=ACCENT, activeforeground="#ffffff",
+                        relief="flat", cursor="hand2", padx=8, command=browse_cmd)
+        btn.grid(row=row, column=2, padx=(0, 18), pady=5)
+        if return_widgets:
+            return lbl, entry, btn
 
-    @staticmethod
-    def _style_combobox(cb: ttk.Combobox):
+    def _style_combobox(self):
         style = ttk.Style()
-        style.configure(
-            "TCombobox",
-            fieldbackground=BG2,
-            background=BG2,
-            foreground=FG,
-            selectbackground=ACCENT,
-            selectforeground="#ffffff",
-            arrowcolor=FG2,
-        )
+        style.configure("TCombobox", fieldbackground=BG2, background=BG2,
+                        foreground=FG, selectbackground=ACCENT,
+                        selectforeground="#ffffff", arrowcolor=FG2)
+
+    # ── 모드 전환 ─────────────────────────────────────────────────────────────
+
+    def _on_mode_change(self):
+        is_generate = self._mode.get() == MODE_GENERATE
+        state = "hidden" if is_generate else "normal"
+
+        # SRT 입력 행 표시/숨김
+        for widget in self._srt_widgets:
+            if is_generate:
+                widget.grid_remove()
+            else:
+                widget.grid()
+
+        # 모델 선택 표시/숨김
+        if is_generate:
+            self._model_label.grid()
+            self._model_cb.grid()
+        else:
+            self._model_label.grid_remove()
+            self._model_cb.grid_remove()
 
     # ── 파일 다이얼로그 ───────────────────────────────────────────────────────
 
@@ -224,48 +217,58 @@ class App(tk.Tk):
     # ── 실행 로직 ─────────────────────────────────────────────────────────────
 
     def _validate(self) -> bool:
-        if not self._media_path.get():
+        if not self._media_path.get() or not os.path.isfile(self._media_path.get()):
             messagebox.showerror("오류", "영상/오디오 파일을 선택하세요.")
             return False
-        if not os.path.isfile(self._media_path.get()):
-            messagebox.showerror("오류", "영상/오디오 파일을 찾을 수 없습니다.")
-            return False
-        if not self._srt_path.get():
-            messagebox.showerror("오류", "입력 SRT 파일을 선택하세요.")
-            return False
-        if not os.path.isfile(self._srt_path.get()):
-            messagebox.showerror("오류", "SRT 파일을 찾을 수 없습니다.")
-            return False
+        if self._mode.get() == MODE_ALIGN:
+            if not self._srt_path.get() or not os.path.isfile(self._srt_path.get()):
+                messagebox.showerror("오류", "입력 SRT 파일을 선택하세요.")
+                return False
         if not self._output_path.get():
             messagebox.showerror("오류", "출력 SRT 경로를 지정하세요.")
             return False
         return True
 
     def _start(self):
-        if self._running:
-            return
-        if not self._validate():
+        if self._running or not self._validate():
             return
 
-        lang_label = self._language.get()
-        lang_code = LANGUAGE_OPTIONS.get(lang_label)
-
+        lang_code = LANGUAGE_OPTIONS.get(self._language.get())
         self._running = True
         self._run_btn.config(state="disabled", text="처리 중...")
         self._progress.start(12)
         self._clear_log()
 
-        thread = threading.Thread(
-            target=self._run_align,
-            args=(
-                self._media_path.get(),
-                self._srt_path.get(),
-                self._output_path.get(),
-                lang_code,
-            ),
-            daemon=True,
-        )
+        if self._mode.get() == MODE_GENERATE:
+            thread = threading.Thread(
+                target=self._run_generate,
+                args=(self._media_path.get(), self._output_path.get(),
+                      lang_code, self._model_size.get()),
+                daemon=True,
+            )
+        else:
+            thread = threading.Thread(
+                target=self._run_align,
+                args=(self._media_path.get(), self._srt_path.get(),
+                      self._output_path.get(), lang_code),
+                daemon=True,
+            )
         thread.start()
+
+    def _run_generate(self, media, output, lang_code, model_size):
+        try:
+            transcribe_and_align(
+                media_path=media,
+                output_srt_path=output,
+                language_code=lang_code,
+                model_size=model_size,
+                log=lambda msg: self._log_queue.put(("normal", msg)),
+            )
+            self._log_queue.put(("success", "✓ 완료! 파일이 저장되었습니다."))
+        except Exception as e:
+            self._log_queue.put(("error", f"✗ 오류: {e}"))
+        finally:
+            self._log_queue.put(("__done__", ""))
 
     def _run_align(self, media, srt, output, lang_code):
         try:
@@ -290,7 +293,7 @@ class App(tk.Tk):
                 tag, msg = self._log_queue.get_nowait()
                 if tag == "__done__":
                     self._progress.stop()
-                    self._run_btn.config(state="normal", text="정렬 시작")
+                    self._run_btn.config(state="normal", text="시작")
                     self._running = False
                 else:
                     self._append_log(msg, tag)
