@@ -45,7 +45,7 @@ class App(tk.Tk):
         self._language = tk.StringVar(value="자동 감지")
         self._model_size = tk.StringVar(value="large-v3")
         self._split_enabled = tk.BooleanVar(value=True)
-        self._max_chars = tk.IntVar(value=42)
+        self._max_chars = tk.IntVar(value=84)
         self._log_queue: queue.Queue = queue.Queue()
         self._running = False
         self._start_time: float = 0.0
