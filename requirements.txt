@@ -2,3 +2,4 @@ whisperx
 torch
 torchaudio
 ffmpeg-python
+spacy

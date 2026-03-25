@@ -10,7 +10,7 @@ WhisperX 기반 자막 생성 및 재정렬 모듈.
 import os
 import re
 import tempfile
-from typing import Callable, List, Optional
+from typing import Any, Callable, List, Optional
 
 import ffmpeg
 import torch
@@ -35,6 +35,28 @@ LANGUAGE_OPTIONS = {
 
 MODEL_OPTIONS = ["tiny", "base", "small", "medium", "large-v2", "large-v3"]
 
+# 언어 코드 → spaCy 모델명
+_SPACY_MODELS = {
+    "en": "en_core_web_sm",
+    "ko": "ko_core_news_sm",
+    "ja": "ja_core_news_sm",
+    "zh": "zh_core_web_sm",
+    "es": "es_core_news_sm",
+    "fr": "fr_core_news_sm",
+    "de": "de_core_news_sm",
+    "ru": "ru_core_news_sm",
+    "pt": "pt_core_news_sm",
+    "it": "it_core_news_sm",
+}
+
+# 줄 끝에 혼자 남으면 어색한 단어들
+_DANGLING_WORDS = {
+    "a", "an", "the",
+    "of", "in", "on", "at", "to", "for", "by", "up", "as",
+    "or", "and", "but", "nor", "so", "yet",
+    "if", "not", "no",
+}
+
 
 def get_device() -> str:
     return "cuda" if torch.cuda.is_available() else "cpu"
@@ -45,13 +67,11 @@ def get_compute_type(device: str) -> str:
 
 
 def build_output_path(base_srt_path: str, lang_code: str) -> str:
-    """'{경로}/{파일명}.srt' → '{경로}/{파일명}.{lang}.srt'"""
     root, ext = os.path.splitext(base_srt_path)
     return f"{root}.{lang_code}{ext}"
 
 
 def extract_audio(input_path: str, output_wav: str) -> None:
-    """영상/오디오 파일에서 16kHz mono wav 추출."""
     (
         ffmpeg
         .input(input_path)
@@ -61,24 +81,124 @@ def extract_audio(input_path: str, output_wav: str) -> None:
     )
 
 
-# 줄 끝에 혼자 남으면 어색한 단어들 (관사, 전치사, 접속사 등)
-_DANGLING_WORDS = {
-    "a", "an", "the",
-    "of", "in", "on", "at", "to", "for", "by", "up", "as",
-    "or", "and", "but", "nor", "so", "yet",
-    "if", "not", "no",
-}
+def load_spacy_model(lang_code: str, log: Callable[[str], None] = print) -> Optional[Any]:
+    """spaCy 모델 로드. 미설치 시 None 반환."""
+    model_name = _SPACY_MODELS.get(lang_code)
+    if not model_name:
+        return None
+    try:
+        import spacy
+        return spacy.load(model_name, disable=["ner", "lemmatizer"])
+    except OSError:
+        log(f"spaCy '{model_name}' 미설치 → 기본 분할 방식 사용.")
+        log(f"  더 정확한 분할: python -m spacy download {model_name}")
+        return None
+    except ImportError:
+        return None
+
+
+def _get_noun_chunk_spans(text: str, nlp: Any) -> List[tuple]:
+    """명사구 (start_char, end_char) 목록."""
+    try:
+        doc = nlp(text)
+        return [(chunk.start_char, chunk.end_char) for chunk in doc.noun_chunks]
+    except Exception:
+        return []
+
+
+def _is_safe_cut(cut_char: int, noun_spans: List[tuple]) -> bool:
+    """cut_char 위치가 명사구 중간이 아닌지 확인."""
+    for span_start, span_end in noun_spans:
+        if span_start < cut_char < span_end:
+            return False
+    return True
+
+
+def _split_words_smart(
+    words: List[dict],
+    seg_end: float,
+    max_chars: int,
+    noun_spans: List[tuple],
+) -> List[dict]:
+    """
+    word 타임스탬프 기준 분할.
+    명사구 중간에서 자르지 않도록 cut point를 조정.
+    """
+    word_texts = [w.get("word", "").strip() for w in words]
+
+    # 각 단어의 문자 오프셋 계산 (joined text 기준)
+    char_starts: List[int] = []
+    char_ends: List[int] = []
+    pos = 0
+    for wt in word_texts:
+        char_starts.append(pos)
+        char_ends.append(pos + len(wt))
+        pos += len(wt) + 1
+
+    chunks: List[dict] = []
+    start_idx = 0
+
+    while start_idx < len(words):
+        # 남은 텍스트가 max_chars 이하면 그냥 묶기
+        remaining = " ".join(word_texts[start_idx:])
+        if len(remaining) <= max_chars:
+            chunk_words = words[start_idx:]
+            chunks.append({
+                "start": chunk_words[0]["start"],
+                "end": seg_end,
+                "text": remaining,
+                "words": chunk_words,
+            })
+            break
+
+        # max_chars를 초과하는 첫 번째 단어 인덱스 찾기
+        overflow_idx = start_idx
+        for i in range(start_idx, len(words)):
+            chunk_len = char_ends[i] - char_starts[start_idx]
+            if chunk_len > max_chars:
+                overflow_idx = i
+                break
+        else:
+            overflow_idx = len(words)
+
+        # overflow_idx 직전부터 역방향으로 안전한 cut point 탐색
+        cut_idx = None
+        for i in range(overflow_idx - 1, start_idx, -1):
+            cut_char = char_ends[i]
+            if _is_safe_cut(cut_char, noun_spans):
+                cut_idx = i
+                break
+
+        # 역방향에서 못 찾으면 overflow_idx 이후 정방향 탐색
+        if cut_idx is None:
+            for i in range(overflow_idx, len(words)):
+                cut_char = char_ends[i]
+                if _is_safe_cut(cut_char, noun_spans):
+                    cut_idx = i
+                    break
+
+        # 그래도 없으면 그냥 overflow 직전에서 자름
+        if cut_idx is None:
+            cut_idx = max(overflow_idx - 1, start_idx)
+
+        chunk_words = words[start_idx: cut_idx + 1]
+        chunks.append({
+            "start": chunk_words[0]["start"],
+            "end": chunk_words[-1].get("end", chunk_words[-1]["start"] + 0.3),
+            "text": " ".join(word_texts[start_idx: cut_idx + 1]),
+            "words": chunk_words,
+        })
+        start_idx = cut_idx + 1
+
+    return chunks
 
 
 def _fix_dangling(chunks: List[dict]) -> List[dict]:
-    """
-    청크 끝 단어가 관사/전치사/접속사면 다음 청크 앞으로 이동.
-    word 리스트가 있는 청크에만 적용.
-    """
+    """청크 끝 단어가 관사/전치사/접속사면 다음 청크 앞으로 이동."""
     if len(chunks) < 2:
         return chunks
 
-    result = [dict(c) for c in chunks]  # shallow copy
+    result = [dict(c) for c in chunks]
 
     for i in range(len(result) - 1):
         cur_words = result[i].get("words", [])
@@ -89,34 +209,31 @@ def _fix_dangling(chunks: List[dict]) -> List[dict]:
         if last_word.lower() not in _DANGLING_WORDS:
             continue
 
-        # 마지막 단어를 다음 청크로 이동
         move_word = cur_words[-1]
         next_words = [move_word] + result[i + 1].get("words", [])
 
         result[i]["words"] = cur_words[:-1]
         result[i]["text"] = " ".join(w.get("word", "").strip() for w in result[i]["words"])
-        result[i]["end"] = cur_words[-2].get("end", result[i]["end"]) if len(cur_words) > 1 else result[i]["start"]
-
+        result[i]["end"] = (
+            cur_words[-2].get("end", result[i]["end"]) if len(cur_words) > 1 else result[i]["start"]
+        )
         result[i + 1]["words"] = next_words
         result[i + 1]["text"] = " ".join(w.get("word", "").strip() for w in next_words)
         result[i + 1]["start"] = move_word.get("start", result[i + 1]["start"])
 
-    # 빈 청크 제거
     return [c for c in result if c.get("text", "").strip()]
 
 
 def split_long_segments(
     aligned_segments: List[dict],
     max_chars: int = 42,
+    nlp: Optional[Any] = None,
 ) -> List[dict]:
     """
-    긴 세그먼트를 word 타임스탬프 기준으로 분할.
-    분할 후 관사/전치사가 줄 끝에 고립되면 다음 줄로 이동.
-    word 타임스탬프가 없으면 글자 수 비례로 시간 배분.
-
-    Args:
-        aligned_segments: whisperx align() 결과 segments
-        max_chars: 세그먼트당 최대 글자 수
+    긴 세그먼트 분할.
+    - nlp 제공 시: 명사구 경계 인식으로 스마트 분할
+    - nlp 없을 시: 글자 수 기준 + dangling 보정
+    word 타임스탬프 없으면 문장 부호 기준 + 글자 수 비례 시간 배분.
     """
     result = []
     for seg in aligned_segments:
@@ -131,43 +248,15 @@ def split_long_segments(
         words = [w for w in seg.get("words", []) if w.get("start") is not None]
 
         if words:
-            # ── word 타임스탬프 기준 분할 ──────────────────────────────
-            chunks: List[dict] = []
-            cur_words: List[dict] = []
+            # 명사구 spans 계산 (joined word text 기준)
+            joined = " ".join(w.get("word", "").strip() for w in words)
+            noun_spans = _get_noun_chunk_spans(joined, nlp) if nlp else []
 
-            for word in words:
-                w_text = word.get("word", "").strip()
-                if not w_text:
-                    continue
-
-                cur_text_preview = " ".join(
-                    w.get("word", "").strip() for w in cur_words
-                )
-                candidate = (cur_text_preview + " " + w_text).strip()
-
-                if cur_words and len(candidate) > max_chars:
-                    chunks.append({
-                        "start": cur_words[0]["start"],
-                        "end": cur_words[-1].get("end", cur_words[-1]["start"] + 0.3),
-                        "text": cur_text_preview,
-                        "words": cur_words,
-                    })
-                    cur_words = [word]
-                else:
-                    cur_words.append(word)
-
-            if cur_words:
-                chunks.append({
-                    "start": cur_words[0]["start"],
-                    "end": seg_end,
-                    "text": " ".join(w.get("word", "").strip() for w in cur_words),
-                    "words": cur_words,
-                })
-
+            chunks = _split_words_smart(words, seg_end, max_chars, noun_spans)
             result.extend(_fix_dangling(chunks) if chunks else [seg])
 
         else:
-            # ── word 타임스탬프 없음 → 문장 부호 기준 + 글자 수 비례 분할 ──
+            # word 타임스탬프 없음 → 문장 부호 기준 + 비례 분할
             parts = re.split(r'(?<=[.!?,])\s+', text)
             chunks_text: List[str] = []
             cur = ""
@@ -218,7 +307,6 @@ def _merge_with_original_duration(
     aligned_segments: List[dict],
     original_segments: List[SRTSegment],
 ) -> List[SRTSegment]:
-    """새 start + 원본 duration → new_end. 다음 세그먼트 start 초과 시 클리핑."""
     new_starts: List[Optional[float]] = []
     aligned_idx = 0
     for _ in original_segments:
@@ -264,13 +352,6 @@ def transcribe_and_align(
     progress: Callable[[int], None] = lambda _: None,
     confirm_overwrite: Callable[[str], bool] = lambda _: True,
 ) -> None:
-    """
-    모드 1: 자막 생성 + 정렬을 한 번에 처리.
-    출력: {output_srt_path 기본명}.{언어코드}.srt
-
-    Args:
-        max_chars: 세그먼트 최대 글자 수 (0이면 분할 안 함)
-    """
     device = get_device()
     compute_type = get_compute_type(device)
     log(f"장치: {device.upper()}")
@@ -316,7 +397,8 @@ def transcribe_and_align(
         out_segments = aligned["segments"]
         if max_chars > 0:
             log(f"긴 자막 분할 중 (최대 {max_chars}자)...")
-            out_segments = split_long_segments(out_segments, max_chars)
+            nlp = load_spacy_model(detected_lang, log)
+            out_segments = split_long_segments(out_segments, max_chars, nlp)
 
         segments = _wx_segments_to_srt(out_segments)
         if not segments:
@@ -346,13 +428,6 @@ def align_srt(
     progress: Callable[[int], None] = lambda _: None,
     confirm_overwrite: Callable[[str], bool] = lambda _: True,
 ) -> None:
-    """
-    모드 2: 기존 SRT의 타임스탬프만 재정렬.
-    출력: {output_srt_path 기본명}.{언어코드}.srt
-
-    Args:
-        max_chars: 세그먼트 최대 글자 수 (0이면 분할 안 함)
-    """
     device = get_device()
     log(f"장치: {device.upper()}")
 
@@ -407,7 +482,8 @@ def align_srt(
         out_segments = aligned["segments"]
         if max_chars > 0:
             log(f"긴 자막 분할 중 (최대 {max_chars}자)...")
-            out_segments = split_long_segments(out_segments, max_chars)
+            nlp = load_spacy_model(language_code, log)
+            out_segments = split_long_segments(out_segments, max_chars, nlp)
             new_segments = _wx_segments_to_srt(out_segments)
         else:
             log("원본 자막 길이 보존 적용 중...")
