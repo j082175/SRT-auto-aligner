@@ -115,6 +115,7 @@ def transcribe_and_align(
     language_code: Optional[str] = None,
     model_size: str = "large-v3",
     log: Callable[[str], None] = print,
+    progress: Callable[[int], None] = lambda _: None,
 ) -> None:
     """
     모드 1: 자막 생성 + 정렬을 한 번에 처리.
@@ -125,22 +126,26 @@ def transcribe_and_align(
         language_code: 언어 코드 (None이면 자동 감지)
         model_size: Whisper 모델 크기 (기본 large-v3)
         log: 진행 상황 콜백
+        progress: 진행률 콜백 (0~100)
     """
     device = get_device()
     compute_type = get_compute_type(device)
     log(f"장치: {device.upper()}")
 
     log("오디오 추출 중...")
+    progress(10)
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
         tmp_wav = tmp.name
     try:
         extract_audio(media_path, tmp_wav)
         log("오디오 추출 완료.")
+        progress(20)
 
         audio = whisperx.load_audio(tmp_wav)
 
         # 1. Whisper 전사
         log(f"Whisper 모델 로드 중 ({model_size})...")
+        progress(30)
         model = whisperx.load_model(
             model_size,
             device,
@@ -148,20 +153,24 @@ def transcribe_and_align(
             language=language_code,
         )
         log("전사 중...")
+        progress(40)
         result = model.transcribe(audio, batch_size=16)
         detected_lang = result.get("language", language_code or "en")
         log(f"전사 완료. 언어: {detected_lang}")
+        progress(65)
         del model
         if device == "cuda":
             torch.cuda.empty_cache()
 
         # 2. Alignment
         log(f"Alignment 모델 로드 중 (언어: {detected_lang})...")
+        progress(70)
         model_a, metadata = whisperx.load_align_model(
             language_code=detected_lang,
             device=device,
         )
         log("자막 정렬 중...")
+        progress(80)
         aligned = whisperx.align(
             result["segments"],
             model_a,
@@ -171,6 +180,7 @@ def transcribe_and_align(
             return_char_alignments=False,
         )
         log("정렬 완료.")
+        progress(95)
 
         # 3. 저장
         segments = _wx_segments_to_srt(aligned["segments"])
@@ -178,6 +188,7 @@ def transcribe_and_align(
             raise RuntimeError("생성된 자막이 없습니다.")
 
         write_srt(segments, output_srt_path)
+        progress(100)
         log(f"저장 완료: {output_srt_path}")
 
     finally:
@@ -191,6 +202,7 @@ def align_srt(
     output_srt_path: str,
     language_code: Optional[str] = None,
     log: Callable[[str], None] = print,
+    progress: Callable[[int], None] = lambda _: None,
 ) -> None:
     """
     모드 2: 기존 SRT의 타임스탬프만 재정렬.
@@ -201,16 +213,19 @@ def align_srt(
         output_srt_path: 출력 SRT 파일 경로
         language_code: 언어 코드 (None이면 자동 감지)
         log: 진행 상황 콜백
+        progress: 진행률 콜백 (0~100)
     """
     device = get_device()
     log(f"장치: {device.upper()}")
 
     log("오디오 추출 중...")
+    progress(10)
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
         tmp_wav = tmp.name
     try:
         extract_audio(media_path, tmp_wav)
         log("오디오 추출 완료.")
+        progress(25)
 
         log("SRT 파싱 중...")
         srt_segments = parse_srt(srt_path)
@@ -222,6 +237,7 @@ def align_srt(
 
         if language_code is None:
             log("언어 자동 감지 중...")
+            progress(35)
             detect_model = whisperx.load_model("small", device, compute_type="float32")
             detected = detect_model.transcribe(audio, batch_size=4)
             language_code = detected.get("language", "en")
@@ -233,6 +249,7 @@ def align_srt(
             log(f"선택된 언어: {language_code}")
 
         log(f"Alignment 모델 로드 중 (언어: {language_code})...")
+        progress(50)
         model_a, metadata = whisperx.load_align_model(
             language_code=language_code,
             device=device,
@@ -240,6 +257,7 @@ def align_srt(
         log("Alignment 모델 로드 완료.")
 
         log("자막 재정렬 중...")
+        progress(70)
         wx_input = [
             {"start": seg.start, "end": seg.end, "text": seg.text}
             for seg in srt_segments
@@ -253,11 +271,13 @@ def align_srt(
             return_char_alignments=False,
         )
         log("재정렬 완료.")
+        progress(90)
 
         log("원본 자막 길이 보존 적용 중...")
         new_segments = _merge_with_original_duration(aligned["segments"], srt_segments)
 
         write_srt(new_segments, output_srt_path)
+        progress(100)
         log(f"저장 완료: {output_srt_path}")
 
     finally:

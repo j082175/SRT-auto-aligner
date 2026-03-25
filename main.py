@@ -6,6 +6,7 @@ WhisperX 기반 자막 생성+정렬 / 기존 자막 재정렬
 import os
 import queue
 import threading
+import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
@@ -44,6 +45,8 @@ class App(tk.Tk):
         self._model_size = tk.StringVar(value="large-v3")
         self._log_queue: queue.Queue = queue.Queue()
         self._running = False
+        self._start_time: float = 0.0
+        self._timer_after_id = None
 
         self._build_ui()
         self._poll_log()
@@ -110,17 +113,25 @@ class App(tk.Tk):
         )
         self._run_btn.grid(row=8, column=0, columnspan=3, pady=(10, 6))
 
-        # 진행 바
+        # 진행 바 + 경과 시간
+        bottom_frame = tk.Frame(self, bg=BG)
+        bottom_frame.grid(row=9, column=0, columnspan=3, padx=18, pady=(0, 6), sticky="ew")
+
         style = ttk.Style()
         style.theme_use("clam")
         style.configure("custom.Horizontal.TProgressbar",
                         troughcolor=BG2, background=ACCENT,
                         bordercolor=BG, lightcolor=ACCENT, darkcolor=ACCENT)
         self._progress = ttk.Progressbar(
-            self, style="custom.Horizontal.TProgressbar",
-            mode="indeterminate", length=420,
+            bottom_frame, style="custom.Horizontal.TProgressbar",
+            mode="determinate", length=340, maximum=100,
         )
-        self._progress.grid(row=9, column=0, columnspan=3, padx=18, pady=(0, 6))
+        self._progress.pack(side="left")
+
+        self._timer_label = tk.Label(
+            bottom_frame, text="", font=FONT, bg=BG, fg=FG2, width=8, anchor="e"
+        )
+        self._timer_label.pack(side="right")
 
         # 로그 창
         log_frame = tk.Frame(self, bg=BG2)
@@ -236,7 +247,9 @@ class App(tk.Tk):
         lang_code = LANGUAGE_OPTIONS.get(self._language.get())
         self._running = True
         self._run_btn.config(state="disabled", text="처리 중...")
-        self._progress.start(12)
+        self._progress["value"] = 0
+        self._start_time = time.time()
+        self._tick_timer()
         self._clear_log()
 
         if self._mode.get() == MODE_GENERATE:
@@ -253,6 +266,7 @@ class App(tk.Tk):
                       self._output_path.get(), lang_code),
                 daemon=True,
             )
+
         thread.start()
 
     def _run_generate(self, media, output, lang_code, model_size):
@@ -263,6 +277,7 @@ class App(tk.Tk):
                 language_code=lang_code,
                 model_size=model_size,
                 log=lambda msg: self._log_queue.put(("normal", msg)),
+                progress=lambda v: self._log_queue.put(("__progress__", v)),
             )
             self._log_queue.put(("success", "✓ 완료! 파일이 저장되었습니다."))
         except Exception as e:
@@ -278,12 +293,23 @@ class App(tk.Tk):
                 output_srt_path=output,
                 language_code=lang_code,
                 log=lambda msg: self._log_queue.put(("normal", msg)),
+                progress=lambda v: self._log_queue.put(("__progress__", v)),
             )
             self._log_queue.put(("success", "✓ 완료! 파일이 저장되었습니다."))
         except Exception as e:
             self._log_queue.put(("error", f"✗ 오류: {e}"))
         finally:
             self._log_queue.put(("__done__", ""))
+
+    # ── 타이머 ────────────────────────────────────────────────────────────────
+
+    def _tick_timer(self):
+        if not self._running:
+            return
+        elapsed = int(time.time() - self._start_time)
+        m, s = divmod(elapsed, 60)
+        self._timer_label.config(text=f"{m:02d}:{s:02d}")
+        self._timer_after_id = self.after(1000, self._tick_timer)
 
     # ── 로그 폴링 ─────────────────────────────────────────────────────────────
 
@@ -292,9 +318,15 @@ class App(tk.Tk):
             while True:
                 tag, msg = self._log_queue.get_nowait()
                 if tag == "__done__":
-                    self._progress.stop()
+                    if self._timer_after_id:
+                        self.after_cancel(self._timer_after_id)
+                    elapsed = int(time.time() - self._start_time)
+                    m, s = divmod(elapsed, 60)
+                    self._timer_label.config(text=f"{m:02d}:{s:02d}")
                     self._run_btn.config(state="normal", text="시작")
                     self._running = False
+                elif tag == "__progress__":
+                    self._progress["value"] = msg
                 else:
                     self._append_log(msg, tag)
         except queue.Empty:
