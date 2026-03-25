@@ -437,7 +437,8 @@ def transcribe_and_align(
             raise RuntimeError("생성된 자막이 없습니다.")
 
         final_path = build_output_path(output_srt_path, detected_lang)
-        if os.path.exists(final_path) and not confirm_overwrite(final_path):
+        # 자동 감지인 경우에만 후확인 (명시 선택 시 시작 전 이미 확인)
+        if language_code is None and os.path.exists(final_path) and not confirm_overwrite(final_path):
             log("취소되었습니다.")
             return
 
@@ -522,7 +523,8 @@ def align_srt(
             new_segments = _merge_with_original_duration(out_segments, srt_segments)
 
         final_path = build_output_path(output_srt_path, language_code)
-        if os.path.exists(final_path) and not confirm_overwrite(final_path):
+        # 자동 감지인 경우에만 후확인 (명시 선택 시 시작 전 이미 확인)
+        if language_code is None and os.path.exists(final_path) and not confirm_overwrite(final_path):
             log("취소되었습니다.")
             return
 

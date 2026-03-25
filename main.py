@@ -3,6 +3,9 @@ SRT 자동 정렬기 - GUI
 WhisperX 기반 자막 생성+정렬 / 기존 자막 재정렬
 """
 
+import warnings
+warnings.filterwarnings("ignore")
+
 import os
 import queue
 import threading
@@ -11,7 +14,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from typing import Callable
 
-from aligner import LANGUAGE_OPTIONS, MODEL_OPTIONS, align_srt, transcribe_and_align
+from aligner import LANGUAGE_OPTIONS, MODEL_OPTIONS, align_srt, build_output_path, transcribe_and_align
 
 # ── 색상/폰트 상수 ────────────────────────────────────────────────────────────
 BG = "#1e1e2e"
@@ -280,6 +283,17 @@ class App(tk.Tk):
             return
 
         lang_code = LANGUAGE_OPTIONS.get(self._language.get())
+
+        # 언어가 명시적으로 선택된 경우 출력 경로를 미리 계산해서 덮어쓰기 확인
+        if lang_code is not None:
+            preview_path = build_output_path(self._output_path.get(), lang_code)
+            if os.path.exists(preview_path):
+                if not messagebox.askyesno(
+                    "파일 덮어쓰기",
+                    f"이미 존재하는 파일입니다:\n{preview_path}\n\n덮어쓰겠습니까?",
+                ):
+                    return
+
         self._running = True
         self._run_btn.config(state="disabled", text="처리 중...")
         self._progress["value"] = 0
@@ -376,7 +390,8 @@ class App(tk.Tk):
                     elapsed = int(time.time() - self._start_time)
                     m, s = divmod(elapsed, 60)
                     self._timer_label.config(text=f"{m:02d}:{s:02d}")
-                    self._percent_label.config(text="")
+                    self._progress["value"] = 100
+                    self._percent_label.config(text="100%")
                     self._run_btn.config(state="normal", text="시작")
                     self._running = False
                 elif tag == "__progress__":
