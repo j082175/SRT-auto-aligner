@@ -53,6 +53,7 @@ class App(TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk):
         self._output_folder = tk.StringVar()
         self._language = tk.StringVar(value="자동 감지")
         self._model_size = tk.StringVar(value="large-v3")
+        self._batch_size = tk.IntVar(value=16)
         self._split_enabled = tk.BooleanVar(value=True)
         self._max_chars = tk.IntVar(value=84)
         self._log_queue: queue.Queue = queue.Queue()
@@ -99,15 +100,30 @@ class App(TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk):
                                            return_widgets=True, accept_drop=[".srt"])
         self._file_row("출력 폴더", self._output_folder, self._browse_output, 5)
 
-        # 모델 선택 (생성+정렬 모드에서만 표시)
+        # 모델 선택 + batch_size (생성+정렬 모드에서만 표시)
         self._model_label = tk.Label(self, text="Whisper 모델", font=FONT_BOLD, bg=BG, fg=FG2, anchor="w", width=14)
         self._model_label.grid(row=6, column=0, sticky="w", padx=18, pady=5)
+
+        model_batch_frame = tk.Frame(self, bg=BG)
+        model_batch_frame.grid(row=6, column=1, columnspan=2, sticky="w", padx=(0, 18), pady=5)
+
         self._model_cb = ttk.Combobox(
-            self, textvariable=self._model_size,
-            values=MODEL_OPTIONS, state="readonly", font=FONT, width=16,
+            model_batch_frame, textvariable=self._model_size,
+            values=MODEL_OPTIONS, state="readonly", font=FONT, width=14,
         )
-        self._model_cb.grid(row=6, column=1, sticky="w", padx=(0, 6), pady=5)
+        self._model_cb.pack(side="left")
         self._style_combobox()
+
+        tk.Label(model_batch_frame, text="배치", font=FONT, bg=BG, fg=FG2).pack(side="left", padx=(12, 4))
+        self._batch_cb = ttk.Combobox(
+            model_batch_frame, textvariable=self._batch_size,
+            values=[4, 8, 16], state="readonly", font=FONT, width=4,
+        )
+        self._batch_cb.pack(side="left")
+        self._batch_label_hint = tk.Label(
+            model_batch_frame, text="(GPU 부하↑)", font=("Segoe UI", 8), bg=BG, fg=FG2,
+        )
+        self._batch_label_hint.pack(side="left", padx=(4, 0))
 
         # 언어 선택
         tk.Label(self, text="언어", font=FONT_BOLD, bg=BG, fg=FG2, anchor="w", width=14
@@ -246,13 +262,13 @@ class App(TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk):
             else:
                 widget.grid()
 
-        # 모델 선택 표시/숨김
+        # 모델 선택 + 배치 사이즈 표시/숨김
         if is_generate:
             self._model_label.grid()
-            self._model_cb.grid()
+            self._model_cb.master.grid()
         else:
             self._model_label.grid_remove()
-            self._model_cb.grid_remove()
+            self._model_cb.master.grid_remove()
 
     # ── 파일 다이얼로그 ───────────────────────────────────────────────────────
 
@@ -330,7 +346,7 @@ class App(TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk):
             thread = threading.Thread(
                 target=self._run_generate,
                 args=(self._media_path.get(), self._output_folder.get(),
-                      lang_code, self._model_size.get(), max_chars),
+                      lang_code, self._model_size.get(), self._batch_size.get(), max_chars),
                 daemon=True,
             )
         else:
@@ -355,13 +371,14 @@ class App(TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk):
 
         return confirm
 
-    def _run_generate(self, media, output_folder, lang_code, model_size, max_chars):
+    def _run_generate(self, media, output_folder, lang_code, model_size, batch_size, max_chars):
         try:
             transcribe_and_align(
                 media_path=media,
                 output_folder=output_folder,
                 language_code=lang_code,
                 model_size=model_size,
+                batch_size=batch_size,
                 max_chars=max_chars,
                 log=lambda msg: self._log_queue.put(("normal", msg)),
                 progress=lambda v: self._log_queue.put(("__progress__", v)),

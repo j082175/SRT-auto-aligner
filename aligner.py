@@ -10,6 +10,8 @@ WhisperX 기반 자막 생성 및 재정렬 모듈.
 import os
 import re
 import tempfile
+import threading
+import time
 from typing import Any, Callable, List, Optional
 
 import ffmpeg
@@ -123,7 +125,7 @@ def get_device() -> str:
 
 
 def get_compute_type(device: str) -> str:
-    return "float16" if device == "cuda" else "float32"
+    return "int8_float16" if device == "cuda" else "int8"
 
 
 def build_output_path(output_folder: str, input_path: str, lang_code: str) -> str:
@@ -387,6 +389,42 @@ def split_long_segments(
     return result
 
 
+def _fmt_time(s: float) -> str:
+    """초 → MM:SS.mmm 포맷."""
+    m = int(s // 60)
+    return f"{m:02d}:{s - m * 60:06.3f}"
+
+
+def _align_segments_with_progress(
+    segments: List[dict],
+    model_a,
+    metadata,
+    audio,
+    device: str,
+    p_start: float,
+    p_end: float,
+    progress: Callable[[float], None],
+    log: Callable[[str], None],
+) -> dict:
+    """세그먼트를 하나씩 정렬하며 진행률과 로그를 실시간 업데이트."""
+    aligned_segs: List[dict] = []
+    word_segs: List[dict] = []
+    total = len(segments)
+    for i, seg in enumerate(segments):
+        r = whisperx.align([seg], model_a, metadata, audio, device, return_char_alignments=False)
+        if r["segments"]:
+            a = r["segments"][0]
+            aligned_segs.append(a)
+            word_segs.extend(r.get("word_segments", []))
+            t0 = _fmt_time(a.get("start") or seg.get("start", 0))
+            t1 = _fmt_time(a.get("end") or seg.get("end", 0))
+            log(f"[{t0} --> {t1}] {a.get('text', '').strip()}")
+        else:
+            aligned_segs.append(seg)
+        progress(p_start + (i + 1) / total * (p_end - p_start))
+    return {"segments": aligned_segs, "word_segments": word_segs}
+
+
 def _wx_segments_to_srt(wx_segments: List[dict]) -> List[SRTSegment]:
     result = []
     for i, seg in enumerate(wx_segments, start=1):
@@ -443,6 +481,7 @@ def transcribe_and_align(
     output_folder: str,
     language_code: Optional[str] = None,
     model_size: str = "large-v3",
+    batch_size: int = 16,
     max_chars: int = 0,
     log: Callable[[str], None] = print,
     progress: Callable[[int], None] = lambda _: None,
@@ -462,6 +501,7 @@ def transcribe_and_align(
         progress(20)
 
         audio = whisperx.load_audio(tmp_wav)
+        duration = len(audio) / 16000  # 오디오 총 길이(초)
 
         log(f"Whisper 모델 로드 중 ({model_size})...")
         progress(30)
@@ -470,9 +510,22 @@ def transcribe_and_align(
         )
         log("전사 중...")
         progress(40)
-        result = model.transcribe(audio, batch_size=16)
+
+        # 전사 중 진행 바를 40→64% 구간에서 시간 기반으로 천천히 전진
+        _done = threading.Event()
+        def _advance():
+            t0 = time.time()
+            while not _done.is_set():
+                frac = min((time.time() - t0) / max(duration, 1), 0.95)
+                progress(40 + frac * 24)
+                time.sleep(0.3)
+        threading.Thread(target=_advance, daemon=True).start()
+
+        result = model.transcribe(audio, batch_size=batch_size)
+        _done.set()
+
         detected_lang = result.get("language", language_code or "en")
-        log(f"전사 완료. 언어: {detected_lang}")
+        log(f"전사 완료. 언어: {detected_lang} | 세그먼트: {len(result['segments'])}개")
         progress(65)
         del model
         if device == "cuda":
@@ -481,8 +534,7 @@ def transcribe_and_align(
         log(f"Alignment 모델 로드 중 (언어: {detected_lang})...")
         progress(70)
         model_a, metadata = whisperx.load_align_model(language_code=detected_lang, device=device)
-        log("자막 정렬 중...")
-        progress(80)
+
         # 숫자를 단어로 변환해 alignment 정확도 향상 (결과 텍스트는 원본으로 복원)
         orig_texts = [seg.get("text", "") for seg in result["segments"]]
         replacements_list = []
@@ -490,9 +542,12 @@ def transcribe_and_align(
             expanded, replacements = _expand_numbers(seg.get("text", ""), detected_lang)
             seg["text"] = expanded
             replacements_list.append(replacements)
-        aligned = whisperx.align(
+
+        log(f"자막 정렬 중... ({len(result['segments'])}개 세그먼트)")
+        progress(80)
+        aligned = _align_segments_with_progress(
             result["segments"], model_a, metadata, audio, device,
-            return_char_alignments=False,
+            80, 90, progress, log,
         )
         _restore_segments(aligned["segments"], orig_texts, replacements_list)
         log("정렬 완료.")
@@ -572,8 +627,6 @@ def align_srt(
         model_a, metadata = whisperx.load_align_model(language_code=language_code, device=device)
         log("Alignment 모델 로드 완료.")
 
-        log("자막 재정렬 중...")
-        progress(70)
         orig_texts = [seg.text for seg in srt_segments]
         replacements_list = []
         wx_input = []
@@ -581,9 +634,12 @@ def align_srt(
             expanded, replacements = _expand_numbers(seg.text, language_code)
             wx_input.append({"start": seg.start, "end": seg.end, "text": expanded})
             replacements_list.append(replacements)
-        aligned = whisperx.align(
+
+        log(f"자막 재정렬 중... ({len(wx_input)}개 세그먼트)")
+        progress(70)
+        aligned = _align_segments_with_progress(
             wx_input, model_a, metadata, audio, device,
-            return_char_alignments=False,
+            70, 88, progress, log,
         )
         _restore_segments(aligned["segments"], orig_texts, replacements_list)
         log("재정렬 완료.")
