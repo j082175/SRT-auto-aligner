@@ -6,13 +6,12 @@ WhisperX 기반 자막 생성+정렬 / 기존 자막 재정렬
 import warnings
 warnings.filterwarnings("ignore")
 
+import multiprocessing
 import os
 import queue
-import threading
 import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
-from typing import Callable
 
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
@@ -20,7 +19,7 @@ try:
 except ImportError:
     _DND_AVAILABLE = False
 
-from aligner import LANGUAGE_OPTIONS, MODEL_OPTIONS, align_srt, build_output_path, transcribe_and_align
+from aligner import LANGUAGE_OPTIONS, MODEL_OPTIONS, build_output_path
 
 # ── 색상/폰트 상수 ────────────────────────────────────────────────────────────
 BG = "#1e1e2e"
@@ -40,6 +39,71 @@ MODE_GENERATE = "생성 + 정렬"
 MODE_ALIGN = "정렬만"
 
 
+# ── 최상위 worker 함수 (multiprocessing pickle 요건) ─────────────────────────
+
+def _worker_generate(log_queue, resp_queue, media, output_folder,
+                     lang_code, model_size, batch_size, max_chars):
+    import warnings
+    warnings.filterwarnings("ignore")
+    from aligner import transcribe_and_align
+
+    def log(msg): log_queue.put(("normal", msg))
+    def progress(v): log_queue.put(("__progress__", v))
+    def confirm_overwrite(path):
+        log_queue.put(("__ask_overwrite__", path))
+        return resp_queue.get()
+
+    try:
+        transcribe_and_align(
+            media_path=media,
+            output_folder=output_folder,
+            language_code=lang_code,
+            model_size=model_size,
+            batch_size=batch_size,
+            max_chars=max_chars,
+            log=log,
+            progress=progress,
+            confirm_overwrite=confirm_overwrite,
+        )
+        log_queue.put(("success", "✓ 완료! 파일이 저장되었습니다."))
+    except Exception as e:
+        log_queue.put(("error", f"✗ 오류: {e}"))
+    finally:
+        log_queue.put(("__done__", ""))
+
+
+def _worker_align(log_queue, resp_queue, media, srt, output_folder,
+                  lang_code, max_chars):
+    import warnings
+    warnings.filterwarnings("ignore")
+    from aligner import align_srt
+
+    def log(msg): log_queue.put(("normal", msg))
+    def progress(v): log_queue.put(("__progress__", v))
+    def confirm_overwrite(path):
+        log_queue.put(("__ask_overwrite__", path))
+        return resp_queue.get()
+
+    try:
+        align_srt(
+            media_path=media,
+            srt_path=srt,
+            output_folder=output_folder,
+            language_code=lang_code,
+            max_chars=max_chars,
+            log=log,
+            progress=progress,
+            confirm_overwrite=confirm_overwrite,
+        )
+        log_queue.put(("success", "✓ 완료! 파일이 저장되었습니다."))
+    except Exception as e:
+        log_queue.put(("error", f"✗ 오류: {e}"))
+    finally:
+        log_queue.put(("__done__", ""))
+
+
+# ── App ───────────────────────────────────────────────────────────────────────
+
 class App(TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk):
     def __init__(self):
         super().__init__()
@@ -56,7 +120,11 @@ class App(TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk):
         self._batch_size = tk.IntVar(value=16)
         self._split_enabled = tk.BooleanVar(value=True)
         self._max_chars = tk.IntVar(value=84)
-        self._log_queue: queue.Queue = queue.Queue()
+
+        self._log_queue: multiprocessing.Queue = multiprocessing.Queue()
+        self._resp_queue: multiprocessing.Queue = multiprocessing.Queue()
+        self._process: multiprocessing.Process = None
+
         self._running = False
         self._start_time: float = 0.0
         self._timer_after_id = None
@@ -120,10 +188,8 @@ class App(TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk):
             values=[4, 8, 16], state="readonly", font=FONT, width=4,
         )
         self._batch_cb.pack(side="left")
-        self._batch_label_hint = tk.Label(
-            model_batch_frame, text="(GPU 부하↑)", font=("Segoe UI", 8), bg=BG, fg=FG2,
-        )
-        self._batch_label_hint.pack(side="left", padx=(4, 0))
+        tk.Label(model_batch_frame, text="(GPU 부하↑)", font=("Segoe UI", 8), bg=BG, fg=FG2
+                 ).pack(side="left", padx=(4, 0))
 
         # 언어 선택
         tk.Label(self, text="언어", font=FONT_BOLD, bg=BG, fg=FG2, anchor="w", width=14
@@ -156,15 +222,28 @@ class App(TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk):
         self._chars_spin.pack(side="left")
         tk.Label(split_frame, text="자", font=FONT, bg=BG, fg=FG2).pack(side="left", padx=(4, 0))
 
-        # 실행 버튼
+        # 시작 / 취소 버튼
+        btn_frame = tk.Frame(self, bg=BG)
+        btn_frame.grid(row=9, column=0, columnspan=3, pady=(10, 6))
+
         self._run_btn = tk.Button(
-            self, text="시작", font=FONT_BOLD,
+            btn_frame, text="시작", font=FONT_BOLD,
             bg=ACCENT, fg="#ffffff",
             activebackground=ACCENT_HOVER, activeforeground="#ffffff",
             relief="flat", cursor="hand2", padx=28, pady=8,
             command=self._start,
         )
-        self._run_btn.grid(row=9, column=0, columnspan=3, pady=(10, 6))
+        self._run_btn.pack(side="left", padx=8)
+
+        self._cancel_btn = tk.Button(
+            btn_frame, text="취소", font=FONT_BOLD,
+            bg=BG2, fg=FG2,
+            activebackground=ERROR, activeforeground="#ffffff",
+            relief="flat", cursor="hand2", padx=28, pady=8,
+            state="disabled",
+            command=self._cancel,
+        )
+        self._cancel_btn.pack(side="left", padx=8)
 
         # 진행 바 + 경과 시간
         bottom_frame = tk.Frame(self, bg=BG)
@@ -224,7 +303,6 @@ class App(TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk):
             return lbl, entry, btn
 
     def _on_drop(self, event, var, accept_exts):
-        # tkinterdnd2는 경로에 공백 있으면 {}로 감쌈
         raw = event.data.strip()
         if raw.startswith("{") and raw.endswith("}"):
             path = raw[1:-1]
@@ -235,7 +313,6 @@ class App(TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk):
             messagebox.showwarning("파일 형식 오류", f"지원하지 않는 파일 형식입니다: {ext}")
             return
         var.set(path)
-        # 출력 폴더 자동 설정
         if var in (self._media_path, self._srt_path) and not self._output_folder.get():
             self._output_folder.set(os.path.dirname(path))
 
@@ -253,16 +330,13 @@ class App(TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk):
 
     def _on_mode_change(self):
         is_generate = self._mode.get() == MODE_GENERATE
-        state = "hidden" if is_generate else "normal"
 
-        # SRT 입력 행 표시/숨김
         for widget in self._srt_widgets:
             if is_generate:
                 widget.grid_remove()
             else:
                 widget.grid()
 
-        # 모델 선택 + 배치 사이즈 표시/숨김
         if is_generate:
             self._model_label.grid()
             self._model_cb.master.grid()
@@ -321,7 +395,6 @@ class App(TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk):
 
         lang_code = LANGUAGE_OPTIONS.get(self._language.get())
 
-        # 언어가 명시적으로 선택된 경우 출력 경로를 미리 계산해서 덮어쓰기 확인
         if lang_code is not None:
             preview_path = build_output_path(
                 self._output_folder.get(), self._media_path.get(), lang_code
@@ -333,9 +406,15 @@ class App(TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk):
                 ):
                     return
 
+        # 매 실행마다 큐 새로 생성 (이전 잔여 메시지 방지)
+        self._log_queue = multiprocessing.Queue()
+        self._resp_queue = multiprocessing.Queue()
+
         self._running = True
         self._run_btn.config(state="disabled", text="처리 중...")
+        self._cancel_btn.config(state="normal", bg=ERROR, fg="#ffffff")
         self._progress["value"] = 0
+        self._percent_label.config(text="")
         self._start_time = time.time()
         self._tick_timer()
         self._clear_log()
@@ -343,70 +422,30 @@ class App(TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk):
         max_chars = self._max_chars.get() if self._split_enabled.get() else 0
 
         if self._mode.get() == MODE_GENERATE:
-            thread = threading.Thread(
-                target=self._run_generate,
-                args=(self._media_path.get(), self._output_folder.get(),
+            self._process = multiprocessing.Process(
+                target=_worker_generate,
+                args=(self._log_queue, self._resp_queue,
+                      self._media_path.get(), self._output_folder.get(),
                       lang_code, self._model_size.get(), self._batch_size.get(), max_chars),
                 daemon=True,
             )
         else:
-            thread = threading.Thread(
-                target=self._run_align,
-                args=(self._media_path.get(), self._srt_path.get(),
+            self._process = multiprocessing.Process(
+                target=_worker_align,
+                args=(self._log_queue, self._resp_queue,
+                      self._media_path.get(), self._srt_path.get(),
                       self._output_folder.get(), lang_code, max_chars),
                 daemon=True,
             )
 
-        thread.start()
+        self._process.start()
 
-    def _make_confirm_overwrite(self) -> Callable[[str], bool]:
-        """worker 스레드에서 main 스레드 덮어쓰기 다이얼로그를 호출하는 콜백."""
-        event = threading.Event()
-        result = [False]
-
-        def confirm(path: str) -> bool:
-            self._log_queue.put(("__ask_overwrite__", (path, event, result)))
-            event.wait()
-            return result[0]
-
-        return confirm
-
-    def _run_generate(self, media, output_folder, lang_code, model_size, batch_size, max_chars):
-        try:
-            transcribe_and_align(
-                media_path=media,
-                output_folder=output_folder,
-                language_code=lang_code,
-                model_size=model_size,
-                batch_size=batch_size,
-                max_chars=max_chars,
-                log=lambda msg: self._log_queue.put(("normal", msg)),
-                progress=lambda v: self._log_queue.put(("__progress__", v)),
-                confirm_overwrite=self._make_confirm_overwrite(),
-            )
-            self._log_queue.put(("success", "✓ 완료! 파일이 저장되었습니다."))
-        except Exception as e:
-            self._log_queue.put(("error", f"✗ 오류: {e}"))
-        finally:
-            self._log_queue.put(("__done__", ""))
-
-    def _run_align(self, media, srt, output_folder, lang_code, max_chars):
-        try:
-            align_srt(
-                media_path=media,
-                srt_path=srt,
-                output_folder=output_folder,
-                language_code=lang_code,
-                max_chars=max_chars,
-                log=lambda msg: self._log_queue.put(("normal", msg)),
-                progress=lambda v: self._log_queue.put(("__progress__", v)),
-                confirm_overwrite=self._make_confirm_overwrite(),
-            )
-            self._log_queue.put(("success", "✓ 완료! 파일이 저장되었습니다."))
-        except Exception as e:
-            self._log_queue.put(("error", f"✗ 오류: {e}"))
-        finally:
-            self._log_queue.put(("__done__", ""))
+    def _cancel(self):
+        if self._process and self._process.is_alive():
+            self._process.terminate()
+            self._process.join(timeout=2)
+        self._log_queue.put(("error", "✗ 취소되었습니다."))
+        self._log_queue.put(("__cancelled__", ""))
 
     # ── 타이머 ────────────────────────────────────────────────────────────────
 
@@ -420,31 +459,36 @@ class App(TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk):
 
     # ── 로그 폴링 ─────────────────────────────────────────────────────────────
 
+    def _finalize(self, completed: bool = True):
+        if self._timer_after_id:
+            self.after_cancel(self._timer_after_id)
+        elapsed = int(time.time() - self._start_time)
+        m, s = divmod(elapsed, 60)
+        self._timer_label.config(text=f"{m:02d}:{s:02d}")
+        if completed:
+            self._progress["value"] = 100
+            self._percent_label.config(text="100%")
+        self._run_btn.config(state="normal", text="시작")
+        self._cancel_btn.config(state="disabled", bg=BG2, fg=FG2)
+        self._running = False
+
     def _poll_log(self):
         try:
             while True:
                 tag, msg = self._log_queue.get_nowait()
                 if tag == "__done__":
-                    if self._timer_after_id:
-                        self.after_cancel(self._timer_after_id)
-                    elapsed = int(time.time() - self._start_time)
-                    m, s = divmod(elapsed, 60)
-                    self._timer_label.config(text=f"{m:02d}:{s:02d}")
-                    self._progress["value"] = 100
-                    self._percent_label.config(text="100%")
-                    self._run_btn.config(state="normal", text="시작")
-                    self._running = False
+                    self._finalize(completed=True)
+                elif tag == "__cancelled__":
+                    self._finalize(completed=False)
                 elif tag == "__progress__":
                     self._progress["value"] = msg
                     self._percent_label.config(text=f"{int(msg)}%")
                 elif tag == "__ask_overwrite__":
-                    path, event, result = msg
                     answer = messagebox.askyesno(
                         "파일 덮어쓰기",
-                        f"이미 존재하는 파일입니다:\n{path}\n\n덮어쓰겠습니까?",
+                        f"이미 존재하는 파일입니다:\n{msg}\n\n덮어쓰겠습니까?",
                     )
-                    result[0] = answer
-                    event.set()
+                    self._resp_queue.put(answer)
                 else:
                     self._append_log(msg, tag)
         except queue.Empty:
@@ -464,5 +508,6 @@ class App(TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk):
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     app = App()
     app.mainloop()
