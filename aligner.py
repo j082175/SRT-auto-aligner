@@ -500,6 +500,7 @@ def transcribe_and_align(
         progress(30)
         model = whisperx.load_model(
             model_size, device, compute_type=compute_type, language=language_code,
+            vad_options={"min_duration_on": 0.5},
         )
         log("전사 중...")
         progress(40)
