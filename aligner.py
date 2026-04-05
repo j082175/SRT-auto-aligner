@@ -125,7 +125,7 @@ def get_device() -> str:
 
 
 def get_compute_type(device: str) -> str:
-    return "float16" if device == "cuda" else "int8"
+    return "int8_float16" if device == "cuda" else "int8"
 
 
 def build_output_path(output_folder: str, input_path: str, lang_code: str) -> str:
