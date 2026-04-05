@@ -19,7 +19,7 @@ import torch
 import whisperx
 from num2words import num2words
 
-from srt_utils import SRTSegment, parse_srt, write_srt
+from srt_utils import SRTSegment, parse_srt, write_srt, write_txt
 
 
 # 언어 코드 → num2words 언어 코드 매핑
@@ -125,7 +125,7 @@ def get_device() -> str:
 
 
 def get_compute_type(device: str) -> str:
-    return "int8_float16" if device == "cuda" else "int8"
+    return "float16" if device == "cuda" else "int8"
 
 
 def build_output_path(output_folder: str, input_path: str, lang_code: str) -> str:
@@ -406,23 +406,15 @@ def _align_segments_with_progress(
     progress: Callable[[float], None],
     log: Callable[[str], None],
 ) -> dict:
-    """세그먼트를 하나씩 정렬하며 진행률과 로그를 실시간 업데이트."""
-    aligned_segs: List[dict] = []
-    word_segs: List[dict] = []
-    total = len(segments)
-    for i, seg in enumerate(segments):
-        r = whisperx.align([seg], model_a, metadata, audio, device, return_char_alignments=False)
-        if r["segments"]:
-            a = r["segments"][0]
-            aligned_segs.append(a)
-            word_segs.extend(r.get("word_segments", []))
-            t0 = _fmt_time(a.get("start") or seg.get("start", 0))
-            t1 = _fmt_time(a.get("end") or seg.get("end", 0))
-            log(f"[{t0} --> {t1}] {a.get('text', '').strip()}")
-        else:
-            aligned_segs.append(seg)
-        progress(p_start + (i + 1) / total * (p_end - p_start))
-    return {"segments": aligned_segs, "word_segments": word_segs}
+    """전체 세그먼트를 한 번에 정렬하고 결과를 로그로 출력."""
+    progress(p_start)
+    r = whisperx.align(segments, model_a, metadata, audio, device, return_char_alignments=False)
+    for seg in r.get("segments", []):
+        t0 = _fmt_time(seg.get("start") or 0)
+        t1 = _fmt_time(seg.get("end") or 0)
+        log(f"[{t0} --> {t1}] {seg.get('text', '').strip()}")
+    progress(p_end)
+    return r
 
 
 def _wx_segments_to_srt(wx_segments: List[dict]) -> List[SRTSegment]:
@@ -483,6 +475,7 @@ def transcribe_and_align(
     model_size: str = "large-v3",
     batch_size: int = 16,
     max_chars: int = 0,
+    save_txt: bool = False,
     log: Callable[[str], None] = print,
     progress: Callable[[int], None] = lambda _: None,
     confirm_overwrite: Callable[[str], bool] = lambda _: True,
@@ -571,8 +564,13 @@ def transcribe_and_align(
             return
 
         write_srt(segments, final_path)
+        if save_txt:
+            txt_path = os.path.splitext(final_path)[0] + ".txt"
+            write_txt(segments, txt_path)
+            log(f"저장 완료: {final_path}, {os.path.basename(txt_path)}")
+        else:
+            log(f"저장 완료: {final_path}")
         progress(100)
-        log(f"저장 완료: {final_path}")
 
     finally:
         if os.path.exists(tmp_wav):
@@ -585,6 +583,7 @@ def align_srt(
     output_folder: str,
     language_code: Optional[str] = None,
     max_chars: int = 0,
+    save_txt: bool = False,
     log: Callable[[str], None] = print,
     progress: Callable[[int], None] = lambda _: None,
     confirm_overwrite: Callable[[str], bool] = lambda _: True,
@@ -664,8 +663,13 @@ def align_srt(
             return
 
         write_srt(new_segments, final_path)
+        if save_txt:
+            txt_path = os.path.splitext(final_path)[0] + ".txt"
+            write_txt(new_segments, txt_path)
+            log(f"저장 완료: {final_path}, {os.path.basename(txt_path)}")
+        else:
+            log(f"저장 완료: {final_path}")
         progress(100)
-        log(f"저장 완료: {final_path}")
 
     finally:
         if os.path.exists(tmp_wav):

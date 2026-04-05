@@ -58,6 +58,19 @@ def parse_srt(path: str) -> List[SRTSegment]:
     return segments
 
 
+def write_txt(segments: List[SRTSegment], path: str) -> None:
+    lines = []
+    for i, seg in enumerate(segments, start=1):
+        lines.append(str(i))
+        lines.append(
+            f"{_seconds_to_timestamp(seg.start)} --> {_seconds_to_timestamp(seg.end)}"
+        )
+        lines.append(seg.text)
+        lines.append("")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+
 def write_srt(segments: List[SRTSegment], path: str) -> None:
     lines = []
     for i, seg in enumerate(segments, start=1):

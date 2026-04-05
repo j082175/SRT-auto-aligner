@@ -42,7 +42,7 @@ MODE_ALIGN = "정렬만"
 # ── 최상위 worker 함수 (multiprocessing pickle 요건) ─────────────────────────
 
 def _worker_generate(log_queue, resp_queue, media, output_folder,
-                     lang_code, model_size, batch_size, max_chars):
+                     lang_code, model_size, batch_size, max_chars, save_txt):
     import warnings
     warnings.filterwarnings("ignore")
     from aligner import transcribe_and_align
@@ -61,6 +61,7 @@ def _worker_generate(log_queue, resp_queue, media, output_folder,
             model_size=model_size,
             batch_size=batch_size,
             max_chars=max_chars,
+            save_txt=save_txt,
             log=log,
             progress=progress,
             confirm_overwrite=confirm_overwrite,
@@ -73,7 +74,7 @@ def _worker_generate(log_queue, resp_queue, media, output_folder,
 
 
 def _worker_align(log_queue, resp_queue, media, srt, output_folder,
-                  lang_code, max_chars):
+                  lang_code, max_chars, save_txt):
     import warnings
     warnings.filterwarnings("ignore")
     from aligner import align_srt
@@ -91,6 +92,7 @@ def _worker_align(log_queue, resp_queue, media, srt, output_folder,
             output_folder=output_folder,
             language_code=lang_code,
             max_chars=max_chars,
+            save_txt=save_txt,
             log=log,
             progress=progress,
             confirm_overwrite=confirm_overwrite,
@@ -120,6 +122,7 @@ class App(TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk):
         self._batch_size = tk.IntVar(value=16)
         self._split_enabled = tk.BooleanVar(value=True)
         self._max_chars = tk.IntVar(value=84)
+        self._save_txt = tk.BooleanVar(value=False)
 
         self._log_queue: multiprocessing.Queue = multiprocessing.Queue()
         self._resp_queue: multiprocessing.Queue = multiprocessing.Queue()
@@ -221,6 +224,13 @@ class App(TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk):
         )
         self._chars_spin.pack(side="left")
         tk.Label(split_frame, text="자", font=FONT, bg=BG, fg=FG2).pack(side="left", padx=(4, 0))
+
+        tk.Checkbutton(
+            split_frame, text="TXT도 저장",
+            variable=self._save_txt,
+            font=FONT_BOLD, bg=BG, fg=FG,
+            selectcolor=BG2, activebackground=BG, activeforeground=ACCENT,
+        ).pack(side="left", padx=(20, 0))
 
         # 시작 / 취소 버튼
         btn_frame = tk.Frame(self, bg=BG)
@@ -426,7 +436,8 @@ class App(TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk):
                 target=_worker_generate,
                 args=(self._log_queue, self._resp_queue,
                       self._media_path.get(), self._output_folder.get(),
-                      lang_code, self._model_size.get(), self._batch_size.get(), max_chars),
+                      lang_code, self._model_size.get(), self._batch_size.get(),
+                      max_chars, self._save_txt.get()),
                 daemon=True,
             )
         else:
@@ -434,7 +445,7 @@ class App(TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk):
                 target=_worker_align,
                 args=(self._log_queue, self._resp_queue,
                       self._media_path.get(), self._srt_path.get(),
-                      self._output_folder.get(), lang_code, max_chars),
+                      self._output_folder.get(), lang_code, max_chars, self._save_txt.get()),
                 daemon=True,
             )
 
