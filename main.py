@@ -1,6 +1,6 @@
 """
 SRT 자동 정렬기 - GUI
-WhisperX 기반 자막 생성+정렬 / 기존 자막 재정렬
+faster-whisper 기반 자막 생성 / 기존 자막 재정렬(wav2vec2)
 """
 
 import warnings
@@ -35,14 +35,14 @@ FONT_BOLD = ("Segoe UI", 10, "bold")
 FONT_TITLE = ("Segoe UI", 13, "bold")
 FONT_LOG = ("Consolas", 9)
 
-MODE_GENERATE = "생성 + 정렬"
+MODE_GENERATE = "자막 생성"
 MODE_ALIGN = "정렬만"
 
 
 # ── 최상위 worker 함수 (multiprocessing pickle 요건) ─────────────────────────
 
 def _worker_generate(log_queue, resp_queue, media, output_folder,
-                     lang_code, model_size, batch_size, max_chars, save_txt):
+                     lang_code, model_size, max_chars, save_txt):
     import warnings
     warnings.filterwarnings("ignore")
     from aligner import transcribe_and_align
@@ -59,7 +59,6 @@ def _worker_generate(log_queue, resp_queue, media, output_folder,
             output_folder=output_folder,
             language_code=lang_code,
             model_size=model_size,
-            batch_size=batch_size,
             max_chars=max_chars,
             save_txt=save_txt,
             log=log,
@@ -119,7 +118,6 @@ class App(TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk):
         self._output_folder = tk.StringVar()
         self._language = tk.StringVar(value="자동 감지")
         self._model_size = tk.StringVar(value="large-v3")
-        self._batch_size = tk.IntVar(value=16)
         self._split_enabled = tk.BooleanVar(value=True)
         self._max_chars = tk.IntVar(value=84)
         self._save_txt = tk.BooleanVar(value=False)
@@ -142,7 +140,7 @@ class App(TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk):
         # 타이틀
         tk.Label(self, text="SRT 자동 정렬기", font=FONT_TITLE, bg=BG, fg=ACCENT
                  ).grid(row=0, column=0, columnspan=3, pady=(18, 4))
-        tk.Label(self, text="WhisperX(wav2vec2) 기반 자막 생성 및 싱크 정렬",
+        tk.Label(self, text="faster-whisper 기반 자막 생성 / wav2vec2 싱크 정렬",
                  font=("Segoe UI", 9), bg=BG, fg=FG2
                  ).grid(row=1, column=0, columnspan=3, pady=(0, 10))
 
@@ -171,7 +169,7 @@ class App(TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk):
                                            return_widgets=True, accept_drop=[".srt"])
         self._file_row("출력 폴더", self._output_folder, self._browse_output, 5)
 
-        # 모델 선택 + batch_size (생성+정렬 모드에서만 표시)
+        # 모델 선택 (생성 모드에서만 표시)
         self._model_label = tk.Label(self, text="Whisper 모델", font=FONT_BOLD, bg=BG, fg=FG2, anchor="w", width=14)
         self._model_label.grid(row=6, column=0, sticky="w", padx=18, pady=5)
 
@@ -185,14 +183,6 @@ class App(TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk):
         self._model_cb.pack(side="left")
         self._style_combobox()
 
-        tk.Label(model_batch_frame, text="배치", font=FONT, bg=BG, fg=FG2).pack(side="left", padx=(12, 4))
-        self._batch_cb = ttk.Combobox(
-            model_batch_frame, textvariable=self._batch_size,
-            values=[4, 8, 16], state="readonly", font=FONT, width=4,
-        )
-        self._batch_cb.pack(side="left")
-        tk.Label(model_batch_frame, text="(GPU 부하↑)", font=("Segoe UI", 8), bg=BG, fg=FG2
-                 ).pack(side="left", padx=(4, 0))
 
         # 언어 선택
         tk.Label(self, text="언어", font=FONT_BOLD, bg=BG, fg=FG2, anchor="w", width=14
@@ -339,13 +329,15 @@ class App(TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk):
         self._chars_spin.config(state=state)
 
     def _on_mode_change(self):
-        is_generate = self._mode.get() == MODE_GENERATE
+        mode = self._mode.get()
+        is_generate = mode == MODE_GENERATE
+        is_align_only = mode == MODE_ALIGN
 
         for widget in self._srt_widgets:
-            if is_generate:
-                widget.grid_remove()
-            else:
+            if is_align_only:
                 widget.grid()
+            else:
+                widget.grid_remove()
 
         if is_generate:
             self._model_label.grid()
@@ -394,6 +386,7 @@ class App(TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk):
             if not self._srt_path.get() or not os.path.isfile(self._srt_path.get()):
                 messagebox.showerror("오류", "입력 SRT 파일을 선택하세요.")
                 return False
+
         if not self._output_folder.get() or not os.path.isdir(self._output_folder.get()):
             messagebox.showerror("오류", "출력 폴더를 지정하세요.")
             return False
@@ -436,7 +429,7 @@ class App(TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk):
                 target=_worker_generate,
                 args=(self._log_queue, self._resp_queue,
                       self._media_path.get(), self._output_folder.get(),
-                      lang_code, self._model_size.get(), self._batch_size.get(),
+                      lang_code, self._model_size.get(),
                       max_chars, self._save_txt.get()),
                 daemon=True,
             )

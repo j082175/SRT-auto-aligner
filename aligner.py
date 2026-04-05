@@ -16,7 +16,9 @@ from typing import Any, Callable, List, Optional
 
 import ffmpeg
 import torch
+import unicodedata
 import whisperx
+from faster_whisper import WhisperModel
 from num2words import num2words
 
 from srt_utils import SRTSegment, parse_srt, write_srt, write_txt
@@ -417,6 +419,18 @@ def _align_segments_with_progress(
     return r
 
 
+def _is_hallucination(text: str) -> bool:
+    """음표·이모지만으로 구성된 hallucination 세그먼트 여부 판별."""
+    stripped = text.strip()
+    if not stripped:
+        return True
+    for ch in stripped:
+        cat = unicodedata.category(ch)
+        if cat not in ("So", "Cf", "Zs") and not ch.isspace():
+            return False
+    return True
+
+
 def _wx_segments_to_srt(wx_segments: List[dict]) -> List[SRTSegment]:
     result = []
     for i, seg in enumerate(wx_segments, start=1):
@@ -424,6 +438,8 @@ def _wx_segments_to_srt(wx_segments: List[dict]) -> List[SRTSegment]:
         end = seg.get("end")
         text = seg.get("text", "").strip()
         if start is None or end is None or not text:
+            continue
+        if _is_hallucination(text):
             continue
         result.append(SRTSegment(index=i, start=start, end=end, text=text))
     return result
@@ -473,7 +489,6 @@ def transcribe_and_align(
     output_folder: str,
     language_code: Optional[str] = None,
     model_size: str = "large-v3",
-    batch_size: int = 16,
     max_chars: int = 0,
     save_txt: bool = False,
     log: Callable[[str], None] = print,
@@ -494,67 +509,57 @@ def transcribe_and_align(
         progress(20)
 
         audio = whisperx.load_audio(tmp_wav)
-        duration = len(audio) / 16000  # 오디오 총 길이(초)
+        duration = len(audio) / 16000
 
         log(f"Whisper 모델 로드 중 ({model_size})...")
         progress(30)
-        model = whisperx.load_model(
-            model_size, device, compute_type=compute_type, language=language_code,
-            vad_options={"vad_onset": 0.3, "vad_offset": 0.2},
-        )
+        fw_model = WhisperModel(model_size, device=device, compute_type=compute_type)
         log("전사 중...")
         progress(40)
 
-        # 전사 중 진행 바를 40→64% 구간에서 시간 기반으로 천천히 전진
+        # 전사 중 진행 바를 40→90% 구간에서 시간 기반으로 천천히 전진
         _done = threading.Event()
         def _advance():
             t0 = time.time()
             while not _done.is_set():
                 frac = min((time.time() - t0) / max(duration, 1), 0.95)
-                progress(40 + frac * 24)
+                progress(40 + frac * 50)
                 time.sleep(0.3)
         threading.Thread(target=_advance, daemon=True).start()
 
-        result = model.transcribe(audio, batch_size=batch_size)
+        segments_gen, info = fw_model.transcribe(
+            tmp_wav,
+            word_timestamps=True,
+            language=language_code,
+            beam_size=5,
+            condition_on_previous_text=False,
+        )
+        result_segments = []
+        for seg in segments_gen:
+            words = [
+                {"word": w.word, "start": w.start, "end": w.end, "score": w.probability}
+                for w in (seg.words or [])
+            ]
+            result_segments.append({
+                "start": seg.start,
+                "end": seg.end,
+                "text": seg.text.strip(),
+                "words": words,
+            })
         _done.set()
 
-        detected_lang = result.get("language", language_code or "en")
-        log(f"전사 완료. 언어: {detected_lang} | 세그먼트: {len(result['segments'])}개")
-        progress(65)
-        del model
-        if device == "cuda":
-            torch.cuda.empty_cache()
-
-        log(f"Alignment 모델 로드 중 (언어: {detected_lang})...")
-        progress(70)
-        model_a, metadata = whisperx.load_align_model(language_code=detected_lang, device=device)
-
-        # 숫자를 단어로 변환해 alignment 정확도 향상 (결과 텍스트는 원본으로 복원)
-        orig_texts = [seg.get("text", "") for seg in result["segments"]]
-        replacements_list = []
-        for seg in result["segments"]:
-            expanded, replacements = _expand_numbers(seg.get("text", ""), detected_lang)
-            seg["text"] = expanded
-            replacements_list.append(replacements)
-
-        log(f"자막 정렬 중... ({len(result['segments'])}개 세그먼트)")
-        progress(80)
-        aligned = _align_segments_with_progress(
-            result["segments"], model_a, metadata, audio, device,
-            80, 90, progress, log,
-        )
-        _restore_segments(aligned["segments"], orig_texts, replacements_list)
-        log("정렬 완료.")
+        detected_lang = info.language or language_code or "en"
+        log(f"전사 완료. 언어: {detected_lang} | 세그먼트: {len(result_segments)}개")
         progress(90)
 
-        out_segments = aligned["segments"]
+        out_segments = result_segments
         if max_chars > 0:
             log(f"긴 자막 분할 중 (최대 {max_chars}자)...")
             nlp = load_spacy_model(detected_lang, log)
             out_segments = split_long_segments(out_segments, max_chars, nlp)
 
         segments = _wx_segments_to_srt(out_segments)
-        segments = collapse_numbers_in_srt(segments, replacements_list)
+        replacements_list = [[] for _ in segments]
         if not segments:
             raise RuntimeError("생성된 자막이 없습니다.")
 
