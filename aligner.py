@@ -756,6 +756,11 @@ class Qwen3Engine(BaseEngine):
         log(f"Qwen3 subprocess 시작 ({self.model})...")
         progress(30)
 
+        # 자식 stdout/stderr를 UTF-8로 강제 — Windows 기본 cp949 인코딩과 부모 디코더 mismatch 방지
+        # (mismatch 시 한글 [STAGE] 로그와 한국어 전사 결과가 mojibake가 됨)
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "utf-8"
+
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -763,6 +768,7 @@ class Qwen3Engine(BaseEngine):
             text=True,
             encoding="utf-8",
             errors="replace",
+            env=env,
         )
 
         stderr_tail: List[str] = []
