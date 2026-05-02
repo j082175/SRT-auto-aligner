@@ -4,3 +4,13 @@ __pycache__/
 *.pyd
 .env
 *.log
+
+# Virtual environments
+.venv/
+venv/
+*.venv/
+*_venv/
+
+# Eval/scratch folders
+eval_*/
+*_eval/
