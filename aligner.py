@@ -127,6 +127,12 @@ _DANGLING_WORDS = {
     "if", "not", "no",
 }
 
+# 마침표가 붙어도 문장 종결이 아닌 약어 (소문자, .!?, 콤마 떼고 비교)
+_ABBREVIATIONS = {
+    "mr", "mrs", "ms", "dr", "prof", "st", "jr", "sr",
+    "vs", "etc", "ltd", "inc", "co", "corp",
+}
+
 
 def get_device() -> str:
     return "cuda" if torch.cuda.is_available() else "cpu"
@@ -328,15 +334,87 @@ def _fix_dangling(chunks: List[dict]) -> List[dict]:
     return [c for c in result if c.get("text", "").strip()]
 
 
+def _is_sentence_break(word_text: str, next_word_text: str) -> bool:
+    """word_text가 문장 종결 + next_word_text가 새 문장 시작인지.
+
+    - 단어가 .!? 로 끝나야 함
+    - 마침표는 약어(_ABBREVIATIONS)나 단일 글자(initial) 제외
+    - 다음 단어의 첫 알파벳이 대문자여야 (따옴표/괄호는 건너뜀)
+    """
+    s = word_text.strip()
+    if not s or s[-1] not in ".!?":
+        return False
+    if s[-1] == "." :
+        bare = s.rstrip(".!?,").lower()
+        if not bare or len(bare) <= 1 or bare in _ABBREVIATIONS:
+            return False
+    if not next_word_text:
+        return False
+    for c in next_word_text.lstrip():
+        if c.isalpha():
+            return c.isupper()
+        if c in "\"'“‘(":
+            continue
+        return False
+    return False
+
+
+def _count_internal_sentence_breaks(words: List[dict]) -> int:
+    """words 안에서 (마지막 제외) 실제 문장 boundary 개수."""
+    count = 0
+    for i in range(len(words) - 1):
+        if _is_sentence_break(words[i].get("word", ""), words[i + 1].get("word", "")):
+            count += 1
+    return count
+
+
+def _split_at_sentences(
+    words: List[dict], seg_start: float, seg_end: float,
+) -> List[dict]:
+    """words를 _is_sentence_break 위치에서 분할. 약어로 인한 false positive 회피."""
+    if not words:
+        return []
+
+    chunks_words: List[List[dict]] = []
+    current: List[dict] = []
+    for i, w in enumerate(words):
+        current.append(w)
+        next_text = words[i + 1].get("word", "") if i + 1 < len(words) else ""
+        if next_text and _is_sentence_break(w.get("word", ""), next_text):
+            chunks_words.append(current)
+            current = []
+    if current:
+        chunks_words.append(current)
+
+    result: List[dict] = []
+    for chunk_words in chunks_words:
+        chunk_text = " ".join(w.get("word", "").strip() for w in chunk_words)
+        result.append({
+            "start": _first_timestamp(chunk_words, "start", seg_start),
+            "end": _last_timestamp(chunk_words, "end", seg_end),
+            "text": chunk_text,
+            "words": chunk_words,
+        })
+
+    # 중간 청크 end = 다음 청크 start (끊김 방지), 마지막은 seg_end로
+    for i in range(len(result) - 1):
+        result[i]["end"] = result[i + 1]["start"]
+    if result:
+        result[-1]["end"] = seg_end
+
+    return result
+
+
 def split_long_segments(
     aligned_segments: List[dict],
     max_chars: int = 42,
     nlp: Optional[Any] = None,
 ) -> List[dict]:
     """
-    긴 세그먼트 분할.
-    - nlp 제공 시: 명사구 경계 인식으로 스마트 분할
-    - nlp 없을 시: 글자 수 기준 + dangling 보정
+    긴 세그먼트 + 다중 문장 세그먼트 분할.
+    - 글자 수 > max_chars : word-smart 분할 (명사구 경계, dangling 보정)
+    - 문장 종결부호 2개 이상(약어 제외) : 짧아도 문장 단위로 분할
+    - 둘 다 해당하면: 1) 문장 단위 사전 분할 → 2) 그래도 max_chars 초과한 sub만 word-smart 추가 분할
     word 타임스탬프 없으면 문장 부호 기준 + 글자 수 비례 시간 배분.
     """
     result = []
@@ -345,36 +423,68 @@ def split_long_segments(
         seg_start = seg.get("start")
         seg_end = seg.get("end")
 
-        if seg_start is None or seg_end is None or len(text) <= max_chars:
+        if seg_start is None or seg_end is None:
             result.append(seg)
             continue
 
-        # 타임스탬프 없는 단어도 포함 (텍스트 누락 방지)
         words = seg.get("words", [])
-        # 분할 기준으로 쓸 타임스탬프가 하나라도 있으면 word 기반 분할
         has_timestamps = any(w.get("start") is not None for w in words)
 
+        too_long = len(text) > max_chars
         if words and has_timestamps:
-            joined = " ".join(w.get("word", "").strip() for w in words)
-            noun_spans = _get_noun_chunk_spans(joined, nlp) if nlp else []
+            multi_sentence = _count_internal_sentence_breaks(words) >= 1
+        else:
+            # 텍스트만 있을 때는 약어 무시한 거친 카운트
+            multi_sentence = (text.count(".") + text.count("!") + text.count("?")) >= 2
 
-            chunks = _split_words_smart(words, seg_start, seg_end, max_chars, noun_spans)
-            result.extend(_fix_dangling(chunks) if chunks else [seg])
+        if not too_long and not multi_sentence:
+            result.append(seg)
+            continue
+
+        if words and has_timestamps:
+            # 1단계: 다중 문장이면 문장 단위 사전 분할
+            if multi_sentence:
+                pre_chunks = _split_at_sentences(words, seg_start, seg_end)
+            else:
+                pre_chunks = [{"start": seg_start, "end": seg_end, "text": text, "words": words}]
+
+            # 2단계: 각 sub-chunk가 max_chars 초과하면 word-smart로 추가 분할
+            final_chunks: List[dict] = []
+            for pc in pre_chunks:
+                pc_text = pc.get("text", "")
+                pc_words = pc.get("words", [])
+                if len(pc_text) > max_chars and pc_words:
+                    joined = " ".join(w.get("word", "").strip() for w in pc_words)
+                    noun_spans = _get_noun_chunk_spans(joined, nlp) if nlp else []
+                    sub_chunks = _split_words_smart(
+                        pc_words, pc["start"], pc["end"], max_chars, noun_spans,
+                    )
+                    final_chunks.extend(sub_chunks)
+                else:
+                    final_chunks.append(pc)
+
+            result.extend(_fix_dangling(final_chunks) if final_chunks else [seg])
 
         else:
             # word 타임스탬프 없음 → 문장 부호 기준 + 비례 분할
-            parts = re.split(r'(?<=[.!?,])\s+', text)
-            chunks_text: List[str] = []
-            cur = ""
-            for part in parts:
-                candidate = (cur + " " + part).strip() if cur else part
-                if cur and len(candidate) > max_chars:
+            if multi_sentence:
+                # 다중 문장: 문장 종결부호로만 split (콤마 무시)
+                parts = re.split(r'(?<=[.!?])\s+', text)
+                chunks_text = [p.strip() for p in parts if p.strip()]
+            else:
+                # 단일 문장 too_long: 콤마 + 종결부호 기준 + 글자 수 누적
+                parts = re.split(r'(?<=[.!?,])\s+', text)
+                chunks_text = []
+                cur = ""
+                for part in parts:
+                    candidate = (cur + " " + part).strip() if cur else part
+                    if cur and len(candidate) > max_chars:
+                        chunks_text.append(cur)
+                        cur = part
+                    else:
+                        cur = candidate
+                if cur:
                     chunks_text.append(cur)
-                    cur = part
-                else:
-                    cur = candidate
-            if cur:
-                chunks_text.append(cur)
 
             if len(chunks_text) <= 1:
                 result.append(seg)
