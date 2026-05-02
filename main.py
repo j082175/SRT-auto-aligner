@@ -22,7 +22,11 @@ except ImportError:
 from aligner import LANGUAGE_OPTIONS, MODEL_OPTIONS, build_output_path
 
 # 라벨 → 엔진 id (aligner.create_engine에 전달)
-ENGINE_DISPLAY = {"FasterWhisper": "fasterwhisper", "Qwen3-ASR": "qwen3"}
+ENGINE_DISPLAY = {
+    "FasterWhisper": "fasterwhisper",
+    "Qwen3-ASR": "qwen3",
+    "Together API": "together",
+}
 QWEN3_MODEL_OPTIONS = ["0.6B", "1.7B"]
 
 # ── 색상/폰트 상수 ────────────────────────────────────────────────────────────
@@ -200,6 +204,11 @@ class App(TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk):
             self._engine_frame, textvariable=self._qwen3_model,
             values=QWEN3_MODEL_OPTIONS, state="readonly", font=FONT, width=12,
         )
+        # Together API는 모델 고정 (openai/whisper-large-v3) — 안내 라벨만 표시
+        self._together_label = tk.Label(
+            self._engine_frame, text="whisper-large-v3 (API 키 필요)",
+            font=FONT, bg=BG, fg=FG2,
+        )
         # 기본 fasterwhisper → whisper 모델 dropdown 표시
         self._model_cb.pack(side="left")
         self._style_combobox()
@@ -368,12 +377,18 @@ class App(TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk):
             self._engine_frame.grid_remove()
 
     def _on_engine_change(self):
-        """엔진 콤보박스 변경 시 모델 dropdown 교체."""
-        if self._engine_id() == "qwen3":
-            self._model_cb.pack_forget()
+        """엔진 콤보박스 변경 시 모델 dropdown / 안내 라벨 교체."""
+        eng = self._engine_id()
+        # 모두 unpack 후 해당 엔진 위젯만 표시
+        self._model_cb.pack_forget()
+        self._qwen3_model_cb.pack_forget()
+        self._together_label.pack_forget()
+
+        if eng == "qwen3":
             self._qwen3_model_cb.pack(side="left")
-        else:
-            self._qwen3_model_cb.pack_forget()
+        elif eng == "together":
+            self._together_label.pack(side="left")
+        else:  # fasterwhisper
             self._model_cb.pack(side="left")
 
     def _engine_id(self) -> str:
@@ -423,6 +438,20 @@ class App(TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk):
         if not self._output_folder.get() or not os.path.isdir(self._output_folder.get()):
             messagebox.showerror("오류", "출력 폴더를 지정하세요.")
             return False
+
+        # Together API: 시작 전 API 키 사전 확인 (worker spawn 비용 절약)
+        if (self._mode.get() == MODE_GENERATE
+                and self._engine_id() == "together"
+                and not os.environ.get("TOGETHER_API_KEY")):
+            messagebox.showerror(
+                "오류",
+                "Together API를 사용하려면 TOGETHER_API_KEY 환경변수가 필요합니다.\n"
+                "https://api.together.ai/settings/api-keys 에서 키 발급 후\n"
+                "PowerShell에서 setx TOGETHER_API_KEY \"...\" 로 영구 설정하세요.\n"
+                "(setx 후엔 새 PowerShell/GUI 재시작 필요)",
+            )
+            return False
+
         return True
 
     def _start(self):

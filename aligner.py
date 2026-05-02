@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, ClassVar, List, Optional
 
 import ffmpeg
+import requests
 import torch
 import unicodedata
 import whisperx
@@ -837,10 +838,146 @@ class Qwen3Engine(BaseEngine):
 
 
 # ------------------------------------------------------------
+# Together API (whisper-large-v3 클라우드 추론)
+# ------------------------------------------------------------
+
+def _convert_together_to_segments(data: dict) -> List[dict]:
+    """Together verbose_json 응답(segments + words 분리)을 WhisperX 호환 segment로 변환.
+
+    각 segment에 자기 시간 범위에 속하는 words를 모아 붙임. word.start < segment.end 기준.
+    """
+    segments = data.get("segments") or []
+    words = list(data.get("words") or [])
+    if not segments:
+        return []
+
+    word_idx = 0
+    result: List[dict] = []
+    for seg in segments:
+        seg_end = seg.get("end")
+        seg_words: List[dict] = []
+        while word_idx < len(words) and words[word_idx].get("start", 0) < seg_end:
+            w = words[word_idx]
+            seg_words.append({
+                "word": w.get("word", ""),
+                "start": w.get("start"),
+                "end": w.get("end"),
+            })
+            word_idx += 1
+        result.append({
+            "start": seg.get("start"),
+            "end": seg_end,
+            "text": (seg.get("text") or "").strip(),
+            "words": seg_words,
+        })
+    return result
+
+
+class TogetherEngine(BaseEngine):
+    """Together API의 whisper-large-v3 클라우드 추론.
+
+    - TOGETHER_API_KEY 환경변수 필요
+    - 1시간 영상 기준 1.5~2분 (로컬 faster-whisper 대비 약 10배 빠름)
+    - mode 2 (기존 SRT 재정렬) 미지원 — API에 alignment 엔드포인트 없음
+    - 오디오는 multipart 업로드 (Together 한도까지, 통상 100MB+ 가능)
+    """
+    name: ClassVar[str] = "together"
+    supports_align_to_srt: ClassVar[bool] = False
+
+    API_URL: ClassVar[str] = "https://api.together.xyz/v1/audio/transcriptions"
+
+    def __init__(self, model: str = "openai/whisper-large-v3"):
+        self.model = model
+
+    def transcribe(self, audio_path, language_code, log, progress):
+        api_key = os.environ.get("TOGETHER_API_KEY")
+        if not api_key:
+            raise RuntimeError(
+                "TOGETHER_API_KEY 환경변수가 없습니다. "
+                "https://api.together.ai/settings/api-keys 에서 발급받아 설정하세요."
+            )
+
+        # 진행 시뮬레이션용 audio duration (whisperx로 빠르게 로드)
+        try:
+            audio = whisperx.load_audio(audio_path)
+            duration = len(audio) / 16000
+        except Exception:
+            duration = 60.0
+
+        log(f"Together API 업로드 중 ({self.model})...")
+        progress(30)
+
+        # 진행 시뮬레이터: 40→85%까지 (audio_duration / 20) 시간에 걸쳐 advance
+        # API가 빨리 끝나면 멈추고 90으로 점프, 늦으면 85에서 대기
+        estimated = max(duration / 20, 3.0)
+        _done = threading.Event()
+
+        def _advance():
+            t0 = time.time()
+            while not _done.is_set():
+                frac = min((time.time() - t0) / estimated, 0.95)
+                progress(40 + frac * 45)
+                time.sleep(0.3)
+
+        threading.Thread(target=_advance, daemon=True).start()
+
+        form: List[tuple] = [
+            ("model", self.model),
+            ("response_format", "verbose_json"),
+            ("timestamp_granularities[]", "word"),
+            ("timestamp_granularities[]", "segment"),
+        ]
+        if language_code:
+            form.append(("language", language_code))
+
+        try:
+            with open(audio_path, "rb") as f:
+                resp = requests.post(
+                    self.API_URL,
+                    headers={"Authorization": f"Bearer {api_key}"},
+                    files={"file": (os.path.basename(audio_path), f, "audio/wav")},
+                    data=form,
+                    timeout=600,
+                )
+        finally:
+            _done.set()
+
+        if resp.status_code != 200:
+            body = resp.text[:500]
+            raise RuntimeError(f"Together API 실패 (status {resp.status_code}): {body}")
+
+        data = resp.json()
+        detected_lang = data.get("language") or language_code or "en"
+
+        segments = _convert_together_to_segments(data)
+        if not segments:
+            raise RuntimeError("Together API 응답에서 segment를 추출하지 못했습니다.")
+
+        log(
+            f"전사 완료. 언어: {detected_lang} | "
+            f"segment {len(segments)}개, word {len(data.get('words') or [])}개"
+        )
+        progress(90)
+
+        return EngineResult(
+            segments=segments,
+            detected_language=detected_lang,
+            replacements_list=[],
+        )
+
+    def align_to_srt(self, audio_path, srt_segments, language_code, log, progress):
+        raise NotImplementedError(
+            "Together 엔진은 mode 2 (기존 SRT 재정렬)를 지원하지 않습니다. "
+            "API에 alignment 엔드포인트가 없어 새 전사만 가능합니다. "
+            "기존 SRT 재정렬에는 FasterWhisper 엔진을 사용하세요."
+        )
+
+
+# ------------------------------------------------------------
 # 엔진 팩토리
 # ------------------------------------------------------------
 
-ENGINES: List[str] = ["fasterwhisper", "qwen3"]
+ENGINES: List[str] = ["fasterwhisper", "qwen3", "together"]
 
 
 def create_engine(name: str, **kwargs) -> BaseEngine:
@@ -848,12 +985,15 @@ def create_engine(name: str, **kwargs) -> BaseEngine:
 
     fasterwhisper: model_size (str)
     qwen3:         qwen3_model (str: "0.6B" | "1.7B")
+    together:      together_model (str, 기본 "openai/whisper-large-v3")
     """
     name = (name or "").lower()
     if name == "fasterwhisper":
         return FasterWhisperEngine(model_size=kwargs.get("model_size", "large-v3"))
     if name == "qwen3":
         return Qwen3Engine(model=kwargs.get("qwen3_model", "0.6B"))
+    if name == "together":
+        return TogetherEngine(model=kwargs.get("together_model", "openai/whisper-large-v3"))
     raise ValueError(f"지원되지 않는 엔진: {name} (사용 가능: {ENGINES})")
 
 

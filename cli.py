@@ -3,8 +3,10 @@
 
 사용:
     python cli.py --input <video> --output <folder>
-                  [--engine fasterwhisper|qwen3] [--model large-v3]
+                  [--engine fasterwhisper|qwen3|together] [--model large-v3]
                   [--qwen3-model 0.6B] [--language auto] [--save-txt]
+
+  together 엔진은 환경변수 TOGETHER_API_KEY 필요.
 
 stdout: 마지막 줄에 "RESULT: <SRT 절대경로>"
 stderr: 진행 로그, "[PROGRESS] <0~100>" 형식의 진행률
