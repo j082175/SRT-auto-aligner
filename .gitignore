@@ -3,6 +3,7 @@ __pycache__/
 *.pyo
 *.pyd
 .env
+config.json
 *.log
 
 # Virtual environments

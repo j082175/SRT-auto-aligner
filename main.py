@@ -6,12 +6,31 @@ ASR 엔진(FasterWhisper / Qwen3-ASR) 기반 자막 생성 / 기존 자막 재�
 import warnings
 warnings.filterwarnings("ignore")
 
+import json
 import multiprocessing
 import os
 import queue
 import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
+
+_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+
+
+def _load_config() -> dict:
+    try:
+        with open(_CONFIG_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save_config(data: dict) -> None:
+    try:
+        with open(_CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+    except OSError:
+        pass
 
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
@@ -123,6 +142,8 @@ class App(TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk):
         self.resizable(False, False)
         self.configure(bg=BG)
 
+        self._config = _load_config()
+
         self._mode = tk.StringVar(value=MODE_GENERATE)
         self._media_path = tk.StringVar()
         self._srt_path = tk.StringVar()
@@ -131,6 +152,7 @@ class App(TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk):
         self._engine = tk.StringVar(value="FasterWhisper")
         self._model_size = tk.StringVar(value="large-v3")
         self._qwen3_model = tk.StringVar(value="0.6B")
+        self._together_api_key = tk.StringVar(value=self._config.get("together_api_key", ""))
         self._split_enabled = tk.BooleanVar(value=True)
         self._max_chars = tk.IntVar(value=84)
         self._save_txt = tk.BooleanVar(value=False)
@@ -204,11 +226,26 @@ class App(TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk):
             self._engine_frame, textvariable=self._qwen3_model,
             values=QWEN3_MODEL_OPTIONS, state="readonly", font=FONT, width=12,
         )
-        # Together API는 모델 고정 (openai/whisper-large-v3) — 안내 라벨만 표시
-        self._together_label = tk.Label(
-            self._engine_frame, text="whisper-large-v3 (API 키 필요)",
+        # Together API: 모델 고정 + 키 설정 버튼 (모달에서 입력 → config.json에 저장)
+        self._together_frame = tk.Frame(self._engine_frame, bg=BG)
+        tk.Label(
+            self._together_frame, text="whisper-large-v3",
+            font=FONT, bg=BG, fg=FG2,
+        ).pack(side="left", padx=(0, 8))
+        self._together_key_btn = tk.Button(
+            self._together_frame, text="🔑 키 설정",
+            font=FONT, bg=BG2, fg=FG,
+            activebackground=ACCENT, activeforeground="#ffffff",
+            relief="flat", cursor="hand2", padx=8,
+            command=self._open_together_key_dialog,
+        )
+        self._together_key_btn.pack(side="left", padx=(0, 6))
+        self._together_status_label = tk.Label(
+            self._together_frame, text="",
             font=FONT, bg=BG, fg=FG2,
         )
+        self._together_status_label.pack(side="left")
+        self._refresh_together_status()
         # 기본 fasterwhisper → whisper 모델 dropdown 표시
         self._model_cb.pack(side="left")
         self._style_combobox()
@@ -377,19 +414,108 @@ class App(TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk):
             self._engine_frame.grid_remove()
 
     def _on_engine_change(self):
-        """엔진 콤보박스 변경 시 모델 dropdown / 안내 라벨 교체."""
+        """엔진 콤보박스 변경 시 모델 dropdown / Together 키 입력 교체."""
         eng = self._engine_id()
         # 모두 unpack 후 해당 엔진 위젯만 표시
         self._model_cb.pack_forget()
         self._qwen3_model_cb.pack_forget()
-        self._together_label.pack_forget()
+        self._together_frame.pack_forget()
 
         if eng == "qwen3":
             self._qwen3_model_cb.pack(side="left")
         elif eng == "together":
-            self._together_label.pack(side="left")
+            self._together_frame.pack(side="left")
         else:  # fasterwhisper
             self._model_cb.pack(side="left")
+
+    def _save_together_key(self):
+        self._config["together_api_key"] = self._together_api_key.get().strip()
+        _save_config(self._config)
+        self._refresh_together_status()
+
+    def _refresh_together_status(self):
+        has_key = bool(self._together_api_key.get().strip())
+        text = "✓ 키 설정됨" if has_key else "✗ 키 미설정"
+        color = SUCCESS if has_key else ERROR
+        self._together_status_label.config(text=text, fg=color)
+
+    def _open_together_key_dialog(self):
+        """Together API 키 입력 모달 — 입력 → 저장 후 닫힘."""
+        dlg = tk.Toplevel(self)
+        dlg.title("Together API 키 설정")
+        dlg.configure(bg=BG)
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        dlg.grab_set()
+
+        # 부모 창 기준 중앙 배치
+        self.update_idletasks()
+        px, py = self.winfo_rootx(), self.winfo_rooty()
+        pw, ph = self.winfo_width(), self.winfo_height()
+        dw, dh = 420, 200
+        dlg.geometry(f"{dw}x{dh}+{px + (pw - dw) // 2}+{py + (ph - dh) // 2}")
+
+        tk.Label(
+            dlg, text="Together API 키",
+            font=FONT_BOLD, bg=BG, fg=FG,
+        ).pack(pady=(18, 4))
+        tk.Label(
+            dlg, text="https://api.together.ai/settings/api-keys 에서 발급",
+            font=("Segoe UI", 9), bg=BG, fg=FG2,
+        ).pack(pady=(0, 12))
+
+        local_var = tk.StringVar(value=self._together_api_key.get())
+        show_var = tk.BooleanVar(value=False)
+
+        entry_frame = tk.Frame(dlg, bg=BG)
+        entry_frame.pack(pady=(0, 8))
+
+        entry = tk.Entry(
+            entry_frame, textvariable=local_var,
+            show="*", font=FONT, bg=BG2, fg=FG, insertbackground=FG,
+            relief="flat", width=38,
+        )
+        entry.pack(side="left", padx=(0, 6))
+        entry.focus_set()
+
+        def toggle_show():
+            entry.config(show="" if show_var.get() else "*")
+
+        tk.Checkbutton(
+            entry_frame, text="보이기",
+            variable=show_var, command=toggle_show,
+            font=("Segoe UI", 9), bg=BG, fg=FG2,
+            selectcolor=BG2, activebackground=BG, activeforeground=ACCENT,
+        ).pack(side="left")
+
+        btn_frame = tk.Frame(dlg, bg=BG)
+        btn_frame.pack(pady=(14, 18))
+
+        def on_save():
+            self._together_api_key.set(local_var.get().strip())
+            self._save_together_key()
+            dlg.destroy()
+
+        def on_cancel():
+            dlg.destroy()
+
+        tk.Button(
+            btn_frame, text="저장", font=FONT_BOLD,
+            bg=ACCENT, fg="#ffffff",
+            activebackground=ACCENT_HOVER, activeforeground="#ffffff",
+            relief="flat", cursor="hand2", padx=20, pady=6,
+            command=on_save,
+        ).pack(side="left", padx=6)
+        tk.Button(
+            btn_frame, text="취소", font=FONT,
+            bg=BG2, fg=FG2,
+            activebackground=ERROR, activeforeground="#ffffff",
+            relief="flat", cursor="hand2", padx=20, pady=6,
+            command=on_cancel,
+        ).pack(side="left", padx=6)
+
+        dlg.bind("<Return>", lambda e: on_save())
+        dlg.bind("<Escape>", lambda e: on_cancel())
 
     def _engine_id(self) -> str:
         return ENGINE_DISPLAY.get(self._engine.get(), "fasterwhisper")
@@ -439,18 +565,17 @@ class App(TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk):
             messagebox.showerror("오류", "출력 폴더를 지정하세요.")
             return False
 
-        # Together API: 시작 전 API 키 사전 확인 (worker spawn 비용 절약)
-        if (self._mode.get() == MODE_GENERATE
-                and self._engine_id() == "together"
-                and not os.environ.get("TOGETHER_API_KEY")):
-            messagebox.showerror(
-                "오류",
-                "Together API를 사용하려면 TOGETHER_API_KEY 환경변수가 필요합니다.\n"
-                "https://api.together.ai/settings/api-keys 에서 키 발급 후\n"
-                "PowerShell에서 setx TOGETHER_API_KEY \"...\" 로 영구 설정하세요.\n"
-                "(setx 후엔 새 PowerShell/GUI 재시작 필요)",
-            )
-            return False
+        # Together API: 시작 전 키 확인 (입력란 → 환경변수 순)
+        if self._mode.get() == MODE_GENERATE and self._engine_id() == "together":
+            key = self._together_api_key.get().strip() or os.environ.get("TOGETHER_API_KEY", "").strip()
+            if not key:
+                messagebox.showerror(
+                    "오류",
+                    "Together API 키가 없습니다.\n'🔑 키 설정' 버튼으로 입력하세요.",
+                )
+                return False
+            # worker(spawn) 프로세스가 상속받도록 부모 환경에 주입
+            os.environ["TOGETHER_API_KEY"] = key
 
         return True
 
