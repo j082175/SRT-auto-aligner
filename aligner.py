@@ -1,8 +1,9 @@
 """
-WhisperX 기반 자막 생성 및 재정렬 모듈.
+자막 생성 및 재정렬 모듈.
 
-모드 1 - 생성+정렬: 영상 → Whisper 전사 → wav2vec2 alignment → SRT
-모드 2 - 정렬만:   영상 + 기존 SRT → wav2vec2 alignment → SRT
+ASR 엔진을 BaseEngine 인터페이스로 추상화 — 현재 구현: FasterWhisperEngine.
+모드 1 - 생성+정렬: 영상 → engine.transcribe (faster-whisper word_timestamps) → SRT
+모드 2 - 정렬만:   영상 + 기존 SRT → engine.align_to_srt (wav2vec2) → SRT
 
 출력 파일명: {기본경로}.{언어코드}.srt  (예: movie.ko.srt)
 """
@@ -12,7 +13,9 @@ import re
 import tempfile
 import threading
 import time
-from typing import Any, Callable, List, Optional
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from typing import Any, Callable, ClassVar, List, Optional
 
 import ffmpeg
 import torch
@@ -484,36 +487,71 @@ def _merge_with_original_duration(
     return result
 
 
-def transcribe_and_align(
-    media_path: str,
-    output_folder: str,
-    language_code: Optional[str] = None,
-    model_size: str = "large-v3",
-    max_chars: int = 0,
-    save_txt: bool = False,
-    log: Callable[[str], None] = print,
-    progress: Callable[[int], None] = lambda _: None,
-    confirm_overwrite: Callable[[str], bool] = lambda _: True,
-) -> None:
-    device = get_device()
-    compute_type = get_compute_type(device)
-    log(f"장치: {device.upper()}")
+# ============================================================
+# Engine 추상화
+# ============================================================
 
-    log("오디오 추출 중...")
-    progress(10)
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-        tmp_wav = tmp.name
-    try:
-        extract_audio(media_path, tmp_wav)
-        log("오디오 추출 완료.")
-        progress(20)
 
-        audio = whisperx.load_audio(tmp_wav)
+@dataclass
+class EngineResult:
+    """엔진의 전사·정렬 결과.
+
+    segments: WhisperX 호환 dict — {start, end, text, words: [{word, start, end, ...}]}
+    detected_language: 입력받았거나 엔진이 감지한 언어 코드 (예: "en")
+    replacements_list: align_to_srt에서 wav2vec2 정확도 향상용 숫자→단어 트릭 산물.
+        transcribe에선 빈 리스트, mode 2에선 세그먼트별 (단어, 원본숫자) 리스트.
+    """
+    segments: List[dict]
+    detected_language: str
+    replacements_list: list = field(default_factory=list)
+
+
+class BaseEngine(ABC):
+    """ASR 엔진 인터페이스 — 전사+alignment 또는 기존 SRT 재정렬 제공."""
+    name: ClassVar[str] = "base"
+    # 기존 SRT 재정렬(mode 2) 지원 여부. UI 측에서 선택 차단에 사용.
+    supports_align_to_srt: ClassVar[bool] = True
+
+    @abstractmethod
+    def transcribe(
+        self,
+        audio_path: str,
+        language_code: Optional[str],
+        log: Callable[[str], None],
+        progress: Callable[[int], None],
+    ) -> EngineResult:
+        """오디오 → 전사 + word-level 타임스탬프. progress 30~90 보고."""
+
+    @abstractmethod
+    def align_to_srt(
+        self,
+        audio_path: str,
+        srt_segments: List[SRTSegment],
+        language_code: Optional[str],
+        log: Callable[[str], None],
+        progress: Callable[[int], None],
+    ) -> EngineResult:
+        """기존 SRT 텍스트를 오디오 타이밍에 재정렬. progress 35~88 보고."""
+
+
+class FasterWhisperEngine(BaseEngine):
+    """Mode 1: faster-whisper (word_timestamps 직접) — VAD/wav2vec2 없음.
+    Mode 2: whisperx wav2vec2 forced alignment + 숫자 단어 트릭."""
+    name: ClassVar[str] = "fasterwhisper"
+
+    def __init__(self, model_size: str = "large-v3"):
+        self.model_size = model_size
+
+    def transcribe(self, audio_path, language_code, log, progress):
+        device = get_device()
+        compute_type = get_compute_type(device)
+
+        audio = whisperx.load_audio(audio_path)
         duration = len(audio) / 16000
 
-        log(f"Whisper 모델 로드 중 ({model_size})...")
+        log(f"Whisper 모델 로드 중 ({self.model_size})...")
         progress(30)
-        fw_model = WhisperModel(model_size, device=device, compute_type=compute_type)
+        fw_model = WhisperModel(self.model_size, device=device, compute_type=compute_type)
         log("전사 중...")
         progress(40)
 
@@ -528,7 +566,7 @@ def transcribe_and_align(
         threading.Thread(target=_advance, daemon=True).start()
 
         segments_gen, info = fw_model.transcribe(
-            tmp_wav,
+            audio_path,
             word_timestamps=True,
             language=language_code,
             beam_size=5,
@@ -552,67 +590,15 @@ def transcribe_and_align(
         log(f"전사 완료. 언어: {detected_lang} | 세그먼트: {len(result_segments)}개")
         progress(90)
 
-        out_segments = result_segments
-        if max_chars > 0:
-            log(f"긴 자막 분할 중 (최대 {max_chars}자)...")
-            nlp = load_spacy_model(detected_lang, log)
-            out_segments = split_long_segments(out_segments, max_chars, nlp)
+        return EngineResult(
+            segments=result_segments,
+            detected_language=detected_lang,
+            replacements_list=[],
+        )
 
-        segments = _wx_segments_to_srt(out_segments)
-        replacements_list = [[] for _ in segments]
-        if not segments:
-            raise RuntimeError("생성된 자막이 없습니다.")
-
-        final_path = build_output_path(output_folder, media_path, detected_lang)
-        # 자동 감지인 경우에만 후확인 (명시 선택 시 시작 전 이미 확인)
-        if language_code is None and os.path.exists(final_path) and not confirm_overwrite(final_path):
-            log("취소되었습니다.")
-            return
-
-        write_srt(segments, final_path)
-        if save_txt:
-            txt_path = os.path.splitext(final_path)[0] + ".txt"
-            write_txt(segments, txt_path)
-            log(f"저장 완료: {final_path}, {os.path.basename(txt_path)}")
-        else:
-            log(f"저장 완료: {final_path}")
-        progress(100)
-
-    finally:
-        if os.path.exists(tmp_wav):
-            os.remove(tmp_wav)
-
-
-def align_srt(
-    media_path: str,
-    srt_path: str,
-    output_folder: str,
-    language_code: Optional[str] = None,
-    max_chars: int = 0,
-    save_txt: bool = False,
-    log: Callable[[str], None] = print,
-    progress: Callable[[int], None] = lambda _: None,
-    confirm_overwrite: Callable[[str], bool] = lambda _: True,
-) -> None:
-    device = get_device()
-    log(f"장치: {device.upper()}")
-
-    log("오디오 추출 중...")
-    progress(10)
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-        tmp_wav = tmp.name
-    try:
-        extract_audio(media_path, tmp_wav)
-        log("오디오 추출 완료.")
-        progress(25)
-
-        log("SRT 파싱 중...")
-        srt_segments = parse_srt(srt_path)
-        if not srt_segments:
-            raise ValueError("SRT 파일에서 자막을 읽을 수 없습니다.")
-        log(f"자막 {len(srt_segments)}개 세그먼트 로드 완료.")
-
-        audio = whisperx.load_audio(tmp_wav)
+    def align_to_srt(self, audio_path, srt_segments, language_code, log, progress):
+        device = get_device()
+        audio = whisperx.load_audio(audio_path)
 
         if language_code is None:
             log("언어 자동 감지 중...")
@@ -650,19 +636,128 @@ def align_srt(
         log("재정렬 완료.")
         progress(88)
 
-        out_segments = aligned["segments"]
+        return EngineResult(
+            segments=aligned["segments"],
+            detected_language=language_code,
+            replacements_list=replacements_list,
+        )
+
+
+# ============================================================
+# 호스트 함수 — 오디오 추출, 엔진 위임, split·post-process, write
+# ============================================================
+
+
+def transcribe_and_align(
+    media_path: str,
+    output_folder: str,
+    language_code: Optional[str] = None,
+    model_size: str = "large-v3",
+    max_chars: int = 0,
+    save_txt: bool = False,
+    log: Callable[[str], None] = print,
+    progress: Callable[[int], None] = lambda _: None,
+    confirm_overwrite: Callable[[str], bool] = lambda _: True,
+    engine: Optional[BaseEngine] = None,
+) -> None:
+    if engine is None:
+        engine = FasterWhisperEngine(model_size=model_size)
+
+    device = get_device()
+    log(f"장치: {device.upper()}")
+
+    log("오디오 추출 중...")
+    progress(10)
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+        tmp_wav = tmp.name
+    try:
+        extract_audio(media_path, tmp_wav)
+        log("오디오 추출 완료.")
+        progress(20)
+
+        result = engine.transcribe(tmp_wav, language_code, log, progress)
+        detected_lang = result.detected_language
+
+        out_segments = result.segments
         if max_chars > 0:
             log(f"긴 자막 분할 중 (최대 {max_chars}자)...")
-            nlp = load_spacy_model(language_code, log)
+            nlp = load_spacy_model(detected_lang, log)
+            out_segments = split_long_segments(out_segments, max_chars, nlp)
+
+        segments = _wx_segments_to_srt(out_segments)
+        segments = collapse_numbers_in_srt(segments, result.replacements_list)
+        if not segments:
+            raise RuntimeError("생성된 자막이 없습니다.")
+
+        final_path = build_output_path(output_folder, media_path, detected_lang)
+        # 자동 감지인 경우에만 후확인 (명시 선택 시 시작 전 이미 확인)
+        if language_code is None and os.path.exists(final_path) and not confirm_overwrite(final_path):
+            log("취소되었습니다.")
+            return
+
+        write_srt(segments, final_path)
+        if save_txt:
+            txt_path = os.path.splitext(final_path)[0] + ".txt"
+            write_txt(segments, txt_path)
+            log(f"저장 완료: {final_path}, {os.path.basename(txt_path)}")
+        else:
+            log(f"저장 완료: {final_path}")
+        progress(100)
+
+    finally:
+        if os.path.exists(tmp_wav):
+            os.remove(tmp_wav)
+
+
+def align_srt(
+    media_path: str,
+    srt_path: str,
+    output_folder: str,
+    language_code: Optional[str] = None,
+    max_chars: int = 0,
+    save_txt: bool = False,
+    log: Callable[[str], None] = print,
+    progress: Callable[[int], None] = lambda _: None,
+    confirm_overwrite: Callable[[str], bool] = lambda _: True,
+    engine: Optional[BaseEngine] = None,
+) -> None:
+    if engine is None:
+        engine = FasterWhisperEngine()
+
+    device = get_device()
+    log(f"장치: {device.upper()}")
+
+    log("오디오 추출 중...")
+    progress(10)
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+        tmp_wav = tmp.name
+    try:
+        extract_audio(media_path, tmp_wav)
+        log("오디오 추출 완료.")
+        progress(25)
+
+        log("SRT 파싱 중...")
+        srt_segments = parse_srt(srt_path)
+        if not srt_segments:
+            raise ValueError("SRT 파일에서 자막을 읽을 수 없습니다.")
+        log(f"자막 {len(srt_segments)}개 세그먼트 로드 완료.")
+
+        result = engine.align_to_srt(tmp_wav, srt_segments, language_code, log, progress)
+        detected_lang = result.detected_language
+
+        out_segments = result.segments
+        if max_chars > 0:
+            log(f"긴 자막 분할 중 (최대 {max_chars}자)...")
+            nlp = load_spacy_model(detected_lang, log)
             out_segments = split_long_segments(out_segments, max_chars, nlp)
             new_segments = _wx_segments_to_srt(out_segments)
         else:
             log("원본 자막 길이 보존 적용 중...")
             new_segments = _merge_with_original_duration(out_segments, srt_segments)
 
-        new_segments = collapse_numbers_in_srt(new_segments, replacements_list)
+        new_segments = collapse_numbers_in_srt(new_segments, result.replacements_list)
 
-        final_path = build_output_path(output_folder, media_path, language_code)
+        final_path = build_output_path(output_folder, media_path, detected_lang)
         # 자동 감지인 경우에만 후확인 (명시 선택 시 시작 전 이미 확인)
         if language_code is None and os.path.exists(final_path) and not confirm_overwrite(final_path):
             log("취소되었습니다.")
