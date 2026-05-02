@@ -2,7 +2,9 @@
 헤드리스 CLI 진입점 — CEP/외부 프로세스에서 호출용.
 
 사용:
-    python cli.py --input <video> --output <folder> [--engine fasterwhisper] [--model large-v3] [--language auto]
+    python cli.py --input <video> --output <folder>
+                  [--engine fasterwhisper|qwen3] [--model large-v3]
+                  [--qwen3-model 0.6B] [--language auto] [--save-txt]
 
 stdout: 마지막 줄에 "RESULT: <SRT 절대경로>"
 stderr: 진행 로그, "[PROGRESS] <0~100>" 형식의 진행률
@@ -13,28 +15,26 @@ import argparse
 import os
 import sys
 
-from aligner import FasterWhisperEngine, MODEL_OPTIONS, transcribe_and_align
+from aligner import ENGINES, MODEL_OPTIONS, create_engine, transcribe_and_align
 
-ENGINE_CHOICES = ["fasterwhisper"]
-
-
-def build_engine(name: str, model_size: str):
-    if name == "fasterwhisper":
-        return FasterWhisperEngine(model_size=model_size)
-    raise ValueError(f"지원되지 않는 엔진: {name}")
+QWEN3_MODEL_OPTIONS = ["0.6B", "1.7B"]
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="자막 헤드리스 생성 (faster-whisper)")
+    parser = argparse.ArgumentParser(description="자막 헤드리스 생성")
     parser.add_argument("--input", required=True, help="입력 영상 파일")
     parser.add_argument("--output", required=True, help="출력 폴더")
     parser.add_argument(
-        "--engine", default="fasterwhisper", choices=ENGINE_CHOICES,
+        "--engine", default="fasterwhisper", choices=ENGINES,
         help="ASR 엔진 (기본: fasterwhisper)",
     )
     parser.add_argument(
         "--model", default="large-v3", choices=MODEL_OPTIONS,
         help="Whisper 모델 크기 (fasterwhisper 엔진 전용, 기본: large-v3)",
+    )
+    parser.add_argument(
+        "--qwen3-model", default="0.6B", choices=QWEN3_MODEL_OPTIONS,
+        help="Qwen3-ASR 모델 (qwen3 엔진 전용, 기본: 0.6B)",
     )
     parser.add_argument(
         "--language", default="auto",
@@ -63,7 +63,6 @@ def main() -> int:
         # [STAGE] prefix로 CEP가 의도된 메시지만 식별 (외부 라이브러리 warning과 분리)
         print(f"[STAGE] {msg}", file=sys.stderr, flush=True)
         if msg.startswith("저장 완료: "):
-            # "저장 완료: <srt>, <txt>" 형식이면 첫 srt만 잡기
             tail = msg[len("저장 완료: "):].strip()
             captured["path"] = tail.split(",")[0].strip()
 
@@ -71,7 +70,11 @@ def main() -> int:
         print(f"[PROGRESS] {pct}", file=sys.stderr, flush=True)
 
     try:
-        engine = build_engine(args.engine, args.model)
+        engine = create_engine(
+            args.engine,
+            model_size=args.model,
+            qwen3_model=args.qwen3_model,
+        )
         transcribe_and_align(
             media_path=args.input,
             output_folder=args.output,

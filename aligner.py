@@ -8,8 +8,10 @@ ASR 엔진을 BaseEngine 인터페이스로 추상화 — 현재 구현: FasterW
 출력 파일명: {기본경로}.{언어코드}.srt  (예: movie.ko.srt)
 """
 
+import json
 import os
 import re
+import subprocess
 import tempfile
 import threading
 import time
@@ -641,6 +643,212 @@ class FasterWhisperEngine(BaseEngine):
             detected_language=language_code,
             replacements_list=replacements_list,
         )
+
+
+# ------------------------------------------------------------
+# Qwen3 결과 → WhisperX 호환 segment 변환
+# ------------------------------------------------------------
+
+def _normalize_token(token: str) -> str:
+    """Qwen3 단어 매칭 비교용 — 알파벳·숫자·한글만 남기고 소문자."""
+    return re.sub(r"[^a-z0-9가-힣]", "", token.lower())
+
+
+def _convert_qwen3_to_segments(text: str, items: List[dict]) -> List[dict]:
+    """Qwen3 출력(전체 텍스트 + 단어 타임스탬프)을 WhisperX 호환 segment 리스트로 변환.
+
+    구두점은 sentence 분할에 사용하고 결과 텍스트·words에 보존. items는 단순 단어이므로
+    normalize 매칭으로 sentence 단어와 정렬 (qwen3_eval/json_to_srt_sentences.py 로직 차용).
+    """
+    if not items:
+        return []
+
+    sentences = re.split(r"(?<=[.!?])\s+", text.strip())
+    sentences = [s for s in sentences if s.strip()]
+
+    word_idx = 0
+    segments: List[dict] = []
+    for sentence in sentences:
+        sent_words = sentence.split()
+        if not sent_words:
+            continue
+
+        matched: List[dict] = []
+        for sw in sent_words:
+            sw_norm = _normalize_token(sw)
+            if not sw_norm:
+                continue
+            search_limit = min(word_idx + 5, len(items))
+            for j in range(word_idx, search_limit):
+                if _normalize_token(items[j]["text"]) == sw_norm:
+                    matched.append({
+                        "word": sw,  # 원본 (구두점 포함)
+                        "start": items[j]["start"],
+                        "end": items[j]["end"],
+                    })
+                    word_idx = j + 1
+                    break
+
+        if not matched:
+            continue
+
+        segments.append({
+            "start": matched[0]["start"],
+            "end": matched[-1]["end"],
+            "text": sentence,
+            "words": matched,
+        })
+
+    return segments
+
+
+class Qwen3Engine(BaseEngine):
+    """Qwen3-ASR + ForcedAligner-0.6B (별도 venv subprocess).
+
+    동작 조건:
+    - Qwen3 venv python 위치: QWEN3_VENV_PYTHON 환경변수 > <project>/qwen3_venv/.venv > 개발용 fallback
+    - 오디오 경로 ASCII (nagisa C 확장이 한국어 경로 미지원)
+    - mode 2 (기존 SRT 재정렬)는 ForcedAligner의 silence drift 약점으로 미지원
+    """
+    name: ClassVar[str] = "qwen3"
+    supports_align_to_srt: ClassVar[bool] = False
+
+    _DEV_FALLBACK_PYTHON = r"C:\Users\j0821\qwen3_eval\.venv\Scripts\python.exe"
+
+    def __init__(self, model: str = "0.6B"):
+        if model not in ("0.6B", "1.7B"):
+            raise ValueError(f"Qwen3 모델은 0.6B 또는 1.7B만 가능: {model}")
+        self.model = model
+
+    @classmethod
+    def find_python(cls) -> Optional[str]:
+        env = os.environ.get("QWEN3_VENV_PYTHON")
+        if env and os.path.isfile(env):
+            return env
+        here = os.path.dirname(os.path.abspath(__file__))
+        sibling = os.path.join(here, "qwen3_venv", ".venv", "Scripts", "python.exe")
+        if os.path.isfile(sibling):
+            return sibling
+        if os.path.isfile(cls._DEV_FALLBACK_PYTHON):
+            return cls._DEV_FALLBACK_PYTHON
+        return None
+
+    def transcribe(self, audio_path, language_code, log, progress):
+        py = self.find_python()
+        if py is None:
+            raise RuntimeError(
+                "Qwen3 venv python을 찾을 수 없습니다. QWEN3_VENV_PYTHON 환경변수를 설정하거나 "
+                "<프로젝트>/qwen3_venv/.venv 에 설치하세요."
+            )
+        try:
+            audio_path.encode("ascii")
+        except UnicodeEncodeError:
+            raise RuntimeError(
+                f"Qwen3는 ASCII 경로만 지원합니다 (받은 경로: {audio_path}). "
+                "한글이 포함된 환경에서는 FasterWhisper를 사용하세요."
+            )
+
+        runner = os.path.join(os.path.dirname(os.path.abspath(__file__)), "qwen3_runner.py")
+        cmd = [py, runner, "--audio", audio_path, "--model", self.model]
+        if language_code:
+            cmd.extend(["--language", language_code])
+
+        log(f"Qwen3 subprocess 시작 ({self.model})...")
+        progress(30)
+
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+
+        stderr_tail: List[str] = []
+
+        def pump_stderr():
+            for line in proc.stderr:
+                line = line.rstrip()
+                if line.startswith("[STAGE] "):
+                    log(line[len("[STAGE] "):])
+                elif line.startswith("[PROGRESS] "):
+                    try:
+                        progress(int(line[len("[PROGRESS] "):]))
+                    except ValueError:
+                        pass
+                else:
+                    stderr_tail.append(line)
+                    if len(stderr_tail) > 50:
+                        del stderr_tail[0]
+
+        t = threading.Thread(target=pump_stderr, daemon=True)
+        t.start()
+
+        stdout, _ = proc.communicate()
+        t.join(timeout=2.0)
+
+        # stdout 마지막 비어있지 않은 줄이 결과 JSON
+        last_line = ""
+        for line in reversed(stdout.splitlines()):
+            if line.strip():
+                last_line = line
+                break
+
+        if not last_line:
+            tail = "\n".join(stderr_tail[-15:])
+            raise RuntimeError(f"Qwen3 결과 누락 (exit {proc.returncode}):\n{tail}")
+
+        try:
+            payload = json.loads(last_line)
+        except json.JSONDecodeError as e:
+            tail = "\n".join(stderr_tail[-15:])
+            raise RuntimeError(f"Qwen3 JSON 파싱 실패: {e}\nlast: {last_line[:200]}\nstderr:\n{tail}")
+
+        if not payload.get("ok"):
+            raise RuntimeError(f"Qwen3 실패: {payload.get('error', 'unknown')}")
+        if proc.returncode != 0:
+            raise RuntimeError(f"Qwen3 subprocess exit {proc.returncode}")
+
+        segments = _convert_qwen3_to_segments(payload["text"], payload["items"])
+        if not segments:
+            raise RuntimeError("Qwen3 결과에서 segment를 추출하지 못했습니다.")
+        log(f"Qwen3 완료 — segment {len(segments)}개.")
+        progress(90)
+
+        return EngineResult(
+            segments=segments,
+            detected_language=payload["language_detected"],
+            replacements_list=[],  # Qwen3는 숫자→단어 트릭 불필요
+        )
+
+    def align_to_srt(self, audio_path, srt_segments, language_code, log, progress):
+        raise NotImplementedError(
+            "Qwen3 엔진은 mode 2 (기존 SRT 재정렬)를 지원하지 않습니다. "
+            "ForcedAligner의 silence drift로 wav2vec2보다 정확도가 낮기 때문입니다. "
+            "기존 SRT 재정렬에는 FasterWhisper 엔진을 사용하세요."
+        )
+
+
+# ------------------------------------------------------------
+# 엔진 팩토리
+# ------------------------------------------------------------
+
+ENGINES: List[str] = ["fasterwhisper", "qwen3"]
+
+
+def create_engine(name: str, **kwargs) -> BaseEngine:
+    """이름으로 엔진 인스턴스 생성. kwargs는 엔진별 옵션.
+
+    fasterwhisper: model_size (str)
+    qwen3:         qwen3_model (str: "0.6B" | "1.7B")
+    """
+    name = (name or "").lower()
+    if name == "fasterwhisper":
+        return FasterWhisperEngine(model_size=kwargs.get("model_size", "large-v3"))
+    if name == "qwen3":
+        return Qwen3Engine(model=kwargs.get("qwen3_model", "0.6B"))
+    raise ValueError(f"지원되지 않는 엔진: {name} (사용 가능: {ENGINES})")
 
 
 # ============================================================

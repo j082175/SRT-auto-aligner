@@ -1,6 +1,6 @@
 """
 SRT 자동 정렬기 - GUI
-faster-whisper 기반 자막 생성 / 기존 자막 재정렬(wav2vec2)
+ASR 엔진(FasterWhisper / Qwen3-ASR) 기반 자막 생성 / 기존 자막 재정렬(wav2vec2)
 """
 
 import warnings
@@ -20,6 +20,10 @@ except ImportError:
     _DND_AVAILABLE = False
 
 from aligner import LANGUAGE_OPTIONS, MODEL_OPTIONS, build_output_path
+
+# 라벨 → 엔진 id (aligner.create_engine에 전달)
+ENGINE_DISPLAY = {"FasterWhisper": "fasterwhisper", "Qwen3-ASR": "qwen3"}
+QWEN3_MODEL_OPTIONS = ["0.6B", "1.7B"]
 
 # ── 색상/폰트 상수 ────────────────────────────────────────────────────────────
 BG = "#1e1e2e"
@@ -42,10 +46,11 @@ MODE_ALIGN = "정렬만"
 # ── 최상위 worker 함수 (multiprocessing pickle 요건) ─────────────────────────
 
 def _worker_generate(log_queue, resp_queue, media, output_folder,
-                     lang_code, model_size, max_chars, save_txt):
+                     lang_code, model_size, max_chars, save_txt,
+                     engine_id, qwen3_model):
     import warnings
     warnings.filterwarnings("ignore")
-    from aligner import transcribe_and_align
+    from aligner import create_engine, transcribe_and_align
 
     def log(msg): log_queue.put(("normal", msg))
     def progress(v): log_queue.put(("__progress__", v))
@@ -54,6 +59,7 @@ def _worker_generate(log_queue, resp_queue, media, output_folder,
         return resp_queue.get()
 
     try:
+        engine = create_engine(engine_id, model_size=model_size, qwen3_model=qwen3_model)
         transcribe_and_align(
             media_path=media,
             output_folder=output_folder,
@@ -64,6 +70,7 @@ def _worker_generate(log_queue, resp_queue, media, output_folder,
             log=log,
             progress=progress,
             confirm_overwrite=confirm_overwrite,
+            engine=engine,
         )
         log_queue.put(("success", "✓ 완료! 파일이 저장되었습니다."))
     except Exception as e:
@@ -117,7 +124,9 @@ class App(TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk):
         self._srt_path = tk.StringVar()
         self._output_folder = tk.StringVar()
         self._language = tk.StringVar(value="자동 감지")
+        self._engine = tk.StringVar(value="FasterWhisper")
         self._model_size = tk.StringVar(value="large-v3")
+        self._qwen3_model = tk.StringVar(value="0.6B")
         self._split_enabled = tk.BooleanVar(value=True)
         self._max_chars = tk.IntVar(value=84)
         self._save_txt = tk.BooleanVar(value=False)
@@ -169,17 +178,29 @@ class App(TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk):
                                            return_widgets=True, accept_drop=[".srt"])
         self._file_row("출력 폴더", self._output_folder, self._browse_output, 5)
 
-        # 모델 선택 (생성 모드에서만 표시)
-        self._model_label = tk.Label(self, text="Whisper 모델", font=FONT_BOLD, bg=BG, fg=FG2, anchor="w", width=14)
+        # 엔진 + 모델 선택 (생성 모드에서만 표시)
+        self._model_label = tk.Label(self, text="엔진 / 모델", font=FONT_BOLD, bg=BG, fg=FG2, anchor="w", width=14)
         self._model_label.grid(row=6, column=0, sticky="w", padx=18, pady=5)
 
-        model_batch_frame = tk.Frame(self, bg=BG)
-        model_batch_frame.grid(row=6, column=1, columnspan=2, sticky="w", padx=(0, 18), pady=5)
+        self._engine_frame = tk.Frame(self, bg=BG)
+        self._engine_frame.grid(row=6, column=1, columnspan=2, sticky="w", padx=(0, 18), pady=5)
+
+        self._engine_cb = ttk.Combobox(
+            self._engine_frame, textvariable=self._engine,
+            values=list(ENGINE_DISPLAY.keys()), state="readonly", font=FONT, width=12,
+        )
+        self._engine_cb.pack(side="left", padx=(0, 8))
+        self._engine_cb.bind("<<ComboboxSelected>>", lambda e: self._on_engine_change())
 
         self._model_cb = ttk.Combobox(
-            model_batch_frame, textvariable=self._model_size,
-            values=MODEL_OPTIONS, state="readonly", font=FONT, width=14,
+            self._engine_frame, textvariable=self._model_size,
+            values=MODEL_OPTIONS, state="readonly", font=FONT, width=12,
         )
+        self._qwen3_model_cb = ttk.Combobox(
+            self._engine_frame, textvariable=self._qwen3_model,
+            values=QWEN3_MODEL_OPTIONS, state="readonly", font=FONT, width=12,
+        )
+        # 기본 fasterwhisper → whisper 모델 dropdown 표시
         self._model_cb.pack(side="left")
         self._style_combobox()
 
@@ -341,10 +362,22 @@ class App(TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk):
 
         if is_generate:
             self._model_label.grid()
-            self._model_cb.master.grid()
+            self._engine_frame.grid()
         else:
             self._model_label.grid_remove()
-            self._model_cb.master.grid_remove()
+            self._engine_frame.grid_remove()
+
+    def _on_engine_change(self):
+        """엔진 콤보박스 변경 시 모델 dropdown 교체."""
+        if self._engine_id() == "qwen3":
+            self._model_cb.pack_forget()
+            self._qwen3_model_cb.pack(side="left")
+        else:
+            self._qwen3_model_cb.pack_forget()
+            self._model_cb.pack(side="left")
+
+    def _engine_id(self) -> str:
+        return ENGINE_DISPLAY.get(self._engine.get(), "fasterwhisper")
 
     # ── 파일 다이얼로그 ───────────────────────────────────────────────────────
 
@@ -430,10 +463,12 @@ class App(TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk):
                 args=(self._log_queue, self._resp_queue,
                       self._media_path.get(), self._output_folder.get(),
                       lang_code, self._model_size.get(),
-                      max_chars, self._save_txt.get()),
+                      max_chars, self._save_txt.get(),
+                      self._engine_id(), self._qwen3_model.get()),
                 daemon=True,
             )
         else:
+            # mode 2(정렬만)는 Qwen3 미지원 — 항상 FasterWhisper 사용
             self._process = multiprocessing.Process(
                 target=_worker_align,
                 args=(self._log_queue, self._resp_queue,
