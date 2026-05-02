@@ -989,12 +989,15 @@ class TogetherEngine(BaseEngine):
     - TOGETHER_API_KEY 환경변수 필요
     - 1시간 영상 기준 1.5~2분 (로컬 faster-whisper 대비 약 10배 빠름)
     - mode 2 (기존 SRT 재정렬) 미지원 — API에 alignment 엔드포인트 없음
-    - 오디오는 multipart 업로드 (Together 한도까지, 통상 100MB+ 가능)
+    - 긴 영상은 자동으로 N분 단위 mp3 청크로 분할해 순차 업로드 후
+      segment 타임스탬프에 청크 오프셋을 더해 합침 (단일 업로드 한도 회피).
     """
     name: ClassVar[str] = "together"
     supports_align_to_srt: ClassVar[bool] = False
 
     API_URL: ClassVar[str] = "https://api.together.xyz/v1/audio/transcriptions"
+    CHUNK_SECONDS: ClassVar[int] = 1200       # 청크 길이 (20분)
+    CHUNK_BITRATE: ClassVar[str] = "64k"      # mp3 비트레이트 (1분 ≈ 480KB)
 
     def __init__(self, model: str = "openai/whisper-large-v3"):
         self.model = model
@@ -1007,56 +1010,69 @@ class TogetherEngine(BaseEngine):
                 "https://api.together.ai/settings/api-keys 에서 발급받아 설정하세요."
             )
 
-        # 진행 시뮬레이션용 audio duration (whisperx로 빠르게 로드)
+        # 1) 오디오를 N분 단위 mp3 청크로 분할 (단일 업로드 한도 회피)
+        chunks_dir = tempfile.mkdtemp(prefix="together_chunks_")
         try:
-            audio = whisperx.load_audio(audio_path)
-            duration = len(audio) / 16000
-        except Exception:
-            duration = 60.0
+            log(f"오디오를 {self.CHUNK_SECONDS // 60}분 청크로 분할 중...")
+            progress(15)
+            chunk_paths = self._split_to_mp3_chunks(audio_path, chunks_dir)
+            if not chunk_paths:
+                raise RuntimeError("청크 분할 결과가 비어있습니다.")
+            log(f"청크 {len(chunk_paths)}개 생성. Together API로 순차 업로드합니다.")
 
-        log(f"Together API 업로드 중 ({self.model})...")
-        progress(30)
+            # 2) 청크별 transcribe → 절대 시간으로 보정해 누적
+            all_segments: List[dict] = []
+            all_words: List[dict] = []
+            detected_lang: Optional[str] = None
+            base = 20.0
+            span = 70.0  # 20% → 90% 사이에서 청크별 균등 분배
 
-        # 진행 시뮬레이터: 40→85%까지 (audio_duration / 20) 시간에 걸쳐 advance
-        # API가 빨리 끝나면 멈추고 90으로 점프, 늦으면 85에서 대기
-        estimated = max(duration / 20, 3.0)
-        _done = threading.Event()
-
-        def _advance():
-            t0 = time.time()
-            while not _done.is_set():
-                frac = min((time.time() - t0) / estimated, 0.95)
-                progress(40 + frac * 45)
-                time.sleep(0.3)
-
-        threading.Thread(target=_advance, daemon=True).start()
-
-        form: List[tuple] = [
-            ("model", self.model),
-            ("response_format", "verbose_json"),
-            ("timestamp_granularities[]", "word"),
-            ("timestamp_granularities[]", "segment"),
-        ]
-        if language_code:
-            form.append(("language", language_code))
-
-        try:
-            with open(audio_path, "rb") as f:
-                resp = requests.post(
-                    self.API_URL,
-                    headers={"Authorization": f"Bearer {api_key}"},
-                    files={"file": (os.path.basename(audio_path), f, "audio/wav")},
-                    data=form,
-                    timeout=600,
+            for i, chunk in enumerate(chunk_paths):
+                chunk_offset = i * self.CHUNK_SECONDS
+                size_mb = os.path.getsize(chunk) / 1_048_576
+                log(
+                    f"청크 {i+1}/{len(chunk_paths)} 업로드 중 "
+                    f"(오프셋 {chunk_offset // 60}분, {size_mb:.1f}MB)..."
                 )
+                progress(int(base + span * i / len(chunk_paths)))
+
+                data = self._transcribe_one(chunk, api_key, language_code)
+                if detected_lang is None:
+                    detected_lang = data.get("language") or language_code or "en"
+
+                for seg in (data.get("segments") or []):
+                    seg = dict(seg)
+                    if seg.get("start") is not None:
+                        seg["start"] = seg["start"] + chunk_offset
+                    if seg.get("end") is not None:
+                        seg["end"] = seg["end"] + chunk_offset
+                    all_segments.append(seg)
+                for w in (data.get("words") or []):
+                    w = dict(w)
+                    if w.get("start") is not None:
+                        w["start"] = w["start"] + chunk_offset
+                    if w.get("end") is not None:
+                        w["end"] = w["end"] + chunk_offset
+                    all_words.append(w)
+
+            progress(90)
+            data = {
+                "language": detected_lang,
+                "segments": all_segments,
+                "words": all_words,
+            }
         finally:
-            _done.set()
+            # 청크 임시 파일 정리
+            try:
+                for name in os.listdir(chunks_dir):
+                    try:
+                        os.remove(os.path.join(chunks_dir, name))
+                    except OSError:
+                        pass
+                os.rmdir(chunks_dir)
+            except OSError:
+                pass
 
-        if resp.status_code != 200:
-            body = resp.text[:500]
-            raise RuntimeError(f"Together API 실패 (status {resp.status_code}): {body}")
-
-        data = resp.json()
         detected_lang = data.get("language") or language_code or "en"
 
         segments = _convert_together_to_segments(data)
@@ -1067,13 +1083,63 @@ class TogetherEngine(BaseEngine):
             f"전사 완료. 언어: {detected_lang} | "
             f"segment {len(segments)}개, word {len(data.get('words') or [])}개"
         )
-        progress(90)
+        progress(95)
 
         return EngineResult(
             segments=segments,
             detected_language=detected_lang,
             replacements_list=[],
         )
+
+    def _split_to_mp3_chunks(self, audio_path: str, out_dir: str) -> List[str]:
+        """ffmpeg segment muxer로 N초 단위 mp3 청크 생성. 정렬된 청크 경로 리스트 반환."""
+        pattern = os.path.join(out_dir, "chunk_%04d.mp3")
+        (
+            ffmpeg
+            .input(audio_path)
+            .output(
+                pattern,
+                format="segment",
+                segment_time=self.CHUNK_SECONDS,
+                ar=16000,
+                ac=1,
+                acodec="libmp3lame",
+                audio_bitrate=self.CHUNK_BITRATE,
+                reset_timestamps=1,
+            )
+            .overwrite_output()
+            .run(quiet=True)
+        )
+        return sorted(
+            os.path.join(out_dir, name)
+            for name in os.listdir(out_dir)
+            if name.startswith("chunk_") and name.endswith(".mp3")
+        )
+
+    def _transcribe_one(self, file_path: str, api_key: str, language_code) -> dict:
+        """단일 mp3 청크를 Together API로 전사. verbose_json 응답 dict 반환."""
+        form: List[tuple] = [
+            ("model", self.model),
+            ("response_format", "verbose_json"),
+            ("timestamp_granularities[]", "word"),
+            ("timestamp_granularities[]", "segment"),
+        ]
+        if language_code:
+            form.append(("language", language_code))
+
+        with open(file_path, "rb") as f:
+            resp = requests.post(
+                self.API_URL,
+                headers={"Authorization": f"Bearer {api_key}"},
+                files={"file": (os.path.basename(file_path), f, "audio/mpeg")},
+                data=form,
+                timeout=600,
+            )
+
+        if resp.status_code != 200:
+            body = resp.text[:500]
+            raise RuntimeError(f"Together API 실패 (status {resp.status_code}): {body}")
+        return resp.json()
 
     def align_to_srt(self, audio_path, srt_segments, language_code, log, progress):
         raise NotImplementedError(
