@@ -546,6 +546,88 @@ def _is_hallucination(text: str) -> bool:
     return True
 
 
+def _trim_silence_stretch(
+    segments: List[dict],
+    threshold: float = 3.0,
+    buffer: float = 0.5,
+) -> List[dict]:
+    """segment 양 끝의 침묵 구간이 threshold 초 초과면 word 경계에 buffer만 남기고 트림.
+
+    Whisper가 한 발화 안의 드라마틱 포즈를 segment에 포함시키는 경우 wav2vec2 word
+    timestamp 기준으로 잘라낸다. threshold 미만의 자연스러운 침묵·호흡은 그대로 둔다.
+    word timestamps가 없거나 None이면 원본 유지 (안전장치).
+
+    한계: wav2vec2가 침묵 구간에 단어를 stretch하는 경우(Pyannote VAD가 드라마틱
+    포즈를 segment에 포함시켜 결과 audio가 길어진 경우) word timestamp 자체가
+    부정확해 이 트림이 못 잡는다. 그 케이스는 _trim_outlier_segments가 보완.
+    """
+    result = []
+    for seg in segments:
+        new_seg = dict(seg)
+        words = seg.get("words", [])
+        seg_start = seg.get("start")
+        seg_end = seg.get("end")
+
+        if not words or seg_start is None or seg_end is None:
+            result.append(new_seg)
+            continue
+
+        first_word_start = _first_timestamp(words, "start", None)
+        last_word_end = _last_timestamp(words, "end", None)
+
+        if first_word_start is not None and (first_word_start - seg_start) > threshold:
+            new_seg["start"] = first_word_start - buffer
+        if last_word_end is not None and (seg_end - last_word_end) > threshold:
+            new_seg["end"] = last_word_end + buffer
+
+        result.append(new_seg)
+    return result
+
+
+def _trim_outlier_segments(
+    segments: List[dict],
+    outlier_factor: float = 3.0,
+    min_threshold: float = 8.0,
+    target_min: float = 5.0,
+) -> List[dict]:
+    """segment 길이가 다른 segment 대비 outlier로 길면 end-anchored로 트림.
+
+    word timestamp가 부정확해 _trim_silence_stretch가 잡지 못하는 케이스를 보완.
+    전체 segment의 median 길이 대비 outlier_factor 배 이상 + 최소 min_threshold초
+    초과 segment만 발동 — 정상 영상에선 거의 작동하지 않는다.
+
+    트림 후 길이는 max(median*outlier_factor, target_min)초. end는 그대로 두고
+    start만 늦춰 leading silence(드라마틱 포즈)를 제거한다.
+    """
+    if len(segments) < 5:
+        return segments  # 표본 너무 적으면 median 신뢰 못 함
+
+    durations = []
+    for seg in segments:
+        s, e = seg.get("start"), seg.get("end")
+        if s is not None and e is not None:
+            durations.append(e - s)
+    if not durations:
+        return segments
+
+    durations.sort()
+    median = durations[len(durations) // 2]
+    threshold = max(median * outlier_factor, min_threshold)
+    target = max(median * outlier_factor, target_min)
+
+    result = []
+    for seg in segments:
+        new_seg = dict(seg)
+        s, e = seg.get("start"), seg.get("end")
+        if s is None or e is None:
+            result.append(new_seg)
+            continue
+        if (e - s) > threshold:
+            new_seg["start"] = e - target
+        result.append(new_seg)
+    return result
+
+
 def _wx_segments_to_srt(wx_segments: List[dict]) -> List[SRTSegment]:
     result = []
     for i, seg in enumerate(wx_segments, start=1):
@@ -719,11 +801,20 @@ class FasterWhisperEngine(BaseEngine):
             segments, model_a, metadata, audio, device,
             80, 90, progress, log,
         )
+
+        # 드라마틱 포즈로 segment가 비정상적으로 길어진 케이스 정리 (16초짜리 한 줄 등).
+        # 1) word timestamp 기준: 단어 단위 침묵이 3초 초과면 트림 (정확)
+        # 2) outlier 길이 기준: median 대비 3배 + 8초 초과 segment를 end-anchored 트림
+        #    (wav2vec2가 침묵에 단어를 stretch한 경우 보완)
+        # 두 트림 모두 임계값이 보수적이라 정상 segment(0.5~5초)는 영향 안 받음.
+        out_segments = _trim_silence_stretch(aligned["segments"])
+        out_segments = _trim_outlier_segments(out_segments)
+
         log("Alignment 완료.")
         progress(90)
 
         return EngineResult(
-            segments=aligned["segments"],
+            segments=out_segments,
             detected_language=detected_lang,
             replacements_list=[],
         )
