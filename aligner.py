@@ -24,7 +24,6 @@ import requests
 import torch
 import unicodedata
 import whisperx
-from faster_whisper import WhisperModel
 from num2words import num2words
 
 from srt_utils import SRTSegment, parse_srt, write_srt, write_txt
@@ -648,8 +647,16 @@ class BaseEngine(ABC):
 
 
 class FasterWhisperEngine(BaseEngine):
-    """Mode 1: faster-whisper (word_timestamps 직접) — VAD/wav2vec2 없음.
-    Mode 2: whisperx wav2vec2 forced alignment + 숫자 단어 트릭."""
+    """Mode 1·2 모두 동일한 흐름:
+    - whisperx.load_model (Pyannote VAD chunker + faster-whisper backend) 로 전사 —
+      30초 단위 큰 chunk로 처리하므로 모델이 충분한 context를 받아 punctuation·대소문자·
+      문장 구조가 살아 있는 transcription을 만든다.
+    - wav2vec2 forced alignment 로 word 타임스탬프 정확화
+
+    트레이드오프: WhisperX의 batched 처리는 침묵·불분명 구간에서 영상 후반부 대사가
+    끼어드는 환각 가능성이 있다. 다만 faster-whisper 직접 방식은 punctuation을 못 만들어
+    OCR 오류처럼 읽혀, 사용자 평가상 환각이 있더라도 WhisperX 쪽이 훨씬 나음.
+    """
     name: ClassVar[str] = "fasterwhisper"
 
     def __init__(self, model_size: str = "large-v3"):
@@ -664,47 +671,59 @@ class FasterWhisperEngine(BaseEngine):
 
         log(f"Whisper 모델 로드 중 ({self.model_size})...")
         progress(30)
-        fw_model = WhisperModel(self.model_size, device=device, compute_type=compute_type)
+        model = whisperx.load_model(
+            self.model_size, device, compute_type=compute_type,
+            language=language_code,
+            vad_options={"vad_onset": 0.3, "vad_offset": 0.2},
+        )
         log("전사 중...")
         progress(40)
 
-        # 전사 중 진행 바를 40→90% 구간에서 시간 기반으로 천천히 전진
+        # 전사 중 진행 바를 40→65% 구간에서 시간 기반으로 천천히 전진
         _done = threading.Event()
         def _advance():
             t0 = time.time()
             while not _done.is_set():
                 frac = min((time.time() - t0) / max(duration, 1), 0.95)
-                progress(40 + frac * 50)
+                progress(40 + frac * 25)
                 time.sleep(0.3)
         threading.Thread(target=_advance, daemon=True).start()
 
-        segments_gen, info = fw_model.transcribe(
-            audio_path,
-            word_timestamps=True,
-            language=language_code,
-            beam_size=5,
-            condition_on_previous_text=False,
-        )
-        result_segments = []
-        for seg in segments_gen:
-            words = [
-                {"word": w.word, "start": w.start, "end": w.end, "score": w.probability}
-                for w in (seg.words or [])
-            ]
-            result_segments.append({
-                "start": seg.start,
-                "end": seg.end,
-                "text": seg.text.strip(),
-                "words": words,
-            })
+        result = model.transcribe(audio, batch_size=16)
         _done.set()
 
-        detected_lang = info.language or language_code or "en"
-        log(f"전사 완료. 언어: {detected_lang} | 세그먼트: {len(result_segments)}개")
+        detected_lang = result.get("language", language_code or "en")
+        segments = result.get("segments", [])
+        log(f"전사 완료. 언어: {detected_lang} | 세그먼트: {len(segments)}개")
+        progress(65)
+
+        del model
+        if device == "cuda":
+            torch.cuda.empty_cache()
+
+        if not segments:
+            return EngineResult(
+                segments=[],
+                detected_language=detected_lang,
+                replacements_list=[],
+            )
+
+        log(f"Alignment 모델 로드 중 (언어: {detected_lang})...")
+        progress(70)
+        model_a, metadata = whisperx.load_align_model(
+            language_code=detected_lang, device=device,
+        )
+
+        log(f"자막 정렬 중... ({len(segments)}개 세그먼트)")
+        aligned = _align_segments_with_progress(
+            segments, model_a, metadata, audio, device,
+            80, 90, progress, log,
+        )
+        log("Alignment 완료.")
         progress(90)
 
         return EngineResult(
-            segments=result_segments,
+            segments=aligned["segments"],
             detected_language=detected_lang,
             replacements_list=[],
         )
