@@ -587,17 +587,31 @@ def _trim_silence_stretch(
 def _trim_outlier_segments(
     segments: List[dict],
     outlier_factor: float = 3.0,
-    min_threshold: float = 8.0,
+    long_threshold: float = 8.0,
+    short_threshold: float = 5.0,
+    char_rate_factor: float = 2.5,
+    target_chars_per_sec: float = 12.0,
     target_min: float = 5.0,
+    pad_factor: float = 1.5,
+    min_display: float = 2.0,
 ) -> List[dict]:
-    """segment 길이가 다른 segment 대비 outlier로 길면 end-anchored로 트림.
+    """segment 길이가 outlier로 길어진 케이스를 end-anchored로 트림 (2단계 게이트).
 
     word timestamp가 부정확해 _trim_silence_stretch가 잡지 못하는 케이스를 보완.
-    전체 segment의 median 길이 대비 outlier_factor 배 이상 + 최소 min_threshold초
-    초과 segment만 발동 — 정상 영상에선 거의 작동하지 않는다.
 
-    트림 후 길이는 max(median*outlier_factor, target_min)초. end는 그대로 두고
-    start만 늦춰 leading silence(드라마틱 포즈)를 제거한다.
+    1차 게이트 (절대 길이 outlier):
+        length > max(median*outlier_factor, long_threshold).
+        통과 시 length를 max(median*outlier_factor, target_min)로 트림.
+        예: 16초 segment → 5초로 (Falling Down "Rick, have you ever heard...")
+
+    2차 게이트 (텍스트 대비 비례 outlier, short_threshold ~ long_threshold 구간):
+        length > short_threshold AND
+        length > (text_chars / target_chars_per_sec) * char_rate_factor.
+        통과 시 length를 max(median*outlier_factor, expected*pad_factor, min_display)로 트림.
+        예: "Oh, yeah, you really should." 6.91초 → 3.26초 (Cop video).
+
+    텍스트가 길어서 자연스럽게 긴 segment(예: 5초에 70자)는 2차 게이트의 비례
+    검사로 보호되어 트림되지 않음.
     """
     if len(segments) < 5:
         return segments  # 표본 너무 적으면 median 신뢰 못 함
@@ -612,18 +626,29 @@ def _trim_outlier_segments(
 
     durations.sort()
     median = durations[len(durations) // 2]
-    threshold = max(median * outlier_factor, min_threshold)
-    target = max(median * outlier_factor, target_min)
+    long_thresh = max(median * outlier_factor, long_threshold)
+    long_target = max(median * outlier_factor, target_min)
 
     result = []
     for seg in segments:
         new_seg = dict(seg)
         s, e = seg.get("start"), seg.get("end")
+        text = (seg.get("text") or "").strip()
         if s is None or e is None:
             result.append(new_seg)
             continue
-        if (e - s) > threshold:
-            new_seg["start"] = e - target
+
+        actual = e - s
+        if actual > long_thresh:
+            # 1차: 절대 길이 outlier — 기존 동작 유지
+            new_seg["start"] = e - long_target
+        elif actual > short_threshold and text:
+            # 2차: short_threshold ~ long_threshold 구간 + 텍스트 비례 outlier
+            expected = max(1.0, len(text) / target_chars_per_sec)
+            if actual > expected * char_rate_factor:
+                target = max(median * outlier_factor, expected * pad_factor, min_display)
+                new_seg["start"] = e - target
+
         result.append(new_seg)
     return result
 
@@ -802,11 +827,12 @@ class FasterWhisperEngine(BaseEngine):
             80, 90, progress, log,
         )
 
-        # 드라마틱 포즈로 segment가 비정상적으로 길어진 케이스 정리 (16초짜리 한 줄 등).
+        # 드라마틱 포즈로 segment가 비정상적으로 길어진 케이스 정리:
         # 1) word timestamp 기준: 단어 단위 침묵이 3초 초과면 트림 (정확)
-        # 2) outlier 길이 기준: median 대비 3배 + 8초 초과 segment를 end-anchored 트림
-        #    (wav2vec2가 침묵에 단어를 stretch한 경우 보완)
-        # 두 트림 모두 임계값이 보수적이라 정상 segment(0.5~5초)는 영향 안 받음.
+        # 2) outlier 길이 기준 (2단계 게이트):
+        #    - 8초 초과 → 즉시 트림 (Falling Down 16초 케이스 등)
+        #    - 5~8초 + 텍스트 대비 비례 outlier → 트림 (Cop video 6.91초 케이스 등)
+        # 텍스트가 길어 자연스레 긴 segment는 비례 검사로 보호됨.
         out_segments = _trim_silence_stretch(aligned["segments"])
         out_segments = _trim_outlier_segments(out_segments)
 
