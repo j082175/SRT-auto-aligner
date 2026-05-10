@@ -10,7 +10,14 @@ import json
 import multiprocessing
 import os
 import queue
+import sys
 import time
+
+# pythonw.exe 실행 시 stdout/stderr가 None이라 huggingface/tqdm 등의 print가 죽음
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w")
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
@@ -57,10 +64,10 @@ FG = "#cdd6f4"
 FG2 = "#a6adc8"
 SUCCESS = "#a6e3a1"
 ERROR = "#f38ba8"
-FONT = ("Segoe UI", 10)
-FONT_BOLD = ("Segoe UI", 10, "bold")
-FONT_TITLE = ("Segoe UI", 13, "bold")
-FONT_LOG = ("Consolas", 9)
+FONT = ("Malgun Gothic", 10)
+FONT_BOLD = ("Malgun Gothic", 10, "bold")
+FONT_TITLE = ("Malgun Gothic", 13, "bold")
+FONT_LOG = ("Malgun Gothic", 9)
 
 MODE_GENERATE = "자막 생성"
 MODE_ALIGN = "정렬만"
@@ -176,7 +183,7 @@ class App(TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk):
         tk.Label(self, text="SRT 자동 정렬기", font=FONT_TITLE, bg=BG, fg=ACCENT
                  ).grid(row=0, column=0, columnspan=3, pady=(18, 4))
         tk.Label(self, text="faster-whisper 기반 자막 생성 / wav2vec2 싱크 정렬",
-                 font=("Segoe UI", 9), bg=BG, fg=FG2
+                 font=("Malgun Gothic", 9), bg=BG, fg=FG2
                  ).grid(row=1, column=0, columnspan=3, pady=(0, 10))
 
         # 모드 선택
@@ -461,7 +468,7 @@ class App(TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk):
         ).pack(pady=(18, 4))
         tk.Label(
             dlg, text="https://api.together.ai/settings/api-keys 에서 발급",
-            font=("Segoe UI", 9), bg=BG, fg=FG2,
+            font=("Malgun Gothic", 9), bg=BG, fg=FG2,
         ).pack(pady=(0, 12))
 
         local_var = tk.StringVar(value=self._together_api_key.get())
@@ -484,7 +491,7 @@ class App(TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk):
         tk.Checkbutton(
             entry_frame, text="보이기",
             variable=show_var, command=toggle_show,
-            font=("Segoe UI", 9), bg=BG, fg=FG2,
+            font=("Malgun Gothic", 9), bg=BG, fg=FG2,
             selectcolor=BG2, activebackground=BG, activeforeground=ACCENT,
         ).pack(side="left")
 
