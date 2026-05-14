@@ -66,7 +66,9 @@ def main() -> int:
         print(f"[STAGE] {msg}", file=sys.stderr, flush=True)
         if msg.startswith("저장 완료: "):
             tail = msg[len("저장 완료: "):].strip()
-            captured["path"] = tail.split(",")[0].strip()
+            # SRT path 자체에 쉼표가 포함될 수 있으므로 .srt 확장자 위치 기준으로 분리
+            idx = tail.lower().find(".srt")
+            captured["path"] = (tail[:idx + 4] if idx >= 0 else tail).strip()
 
     def progress(pct: int) -> None:
         print(f"[PROGRESS] {pct}", file=sys.stderr, flush=True)
