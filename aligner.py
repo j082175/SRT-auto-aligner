@@ -1213,7 +1213,17 @@ class TogetherEngine(BaseEngine):
 
         segments = _convert_together_to_segments(data)
         if not segments:
-            raise RuntimeError("Together API 응답에서 segment를 추출하지 못했습니다.")
+            raw_keys = sorted(data.keys()) if isinstance(data, dict) else type(data).__name__
+            raw_seg_len = len(data.get("segments") or []) if isinstance(data, dict) else "?"
+            raw_word_len = len(data.get("words") or []) if isinstance(data, dict) else "?"
+            raw_preview = str(data)[:800].replace("\n", " ")
+            log(f"[DEBUG] Together 응답 키: {raw_keys}")
+            log(f"[DEBUG] segments={raw_seg_len}, words={raw_word_len}")
+            log(f"[DEBUG] 응답 일부: {raw_preview}")
+            raise RuntimeError(
+                f"Together API 응답에서 segment를 추출하지 못했습니다. "
+                f"응답 키={raw_keys}, segments={raw_seg_len}, words={raw_word_len}"
+            )
 
         log(
             f"전사 완료. 언어: {detected_lang} | "
