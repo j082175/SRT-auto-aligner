@@ -52,8 +52,10 @@ ENGINE_DISPLAY = {
     "FasterWhisper": "fasterwhisper",
     "Qwen3-ASR": "qwen3",
     "Together API": "together",
+    "ElevenLabs Scribe": "elevenlabs",
 }
 QWEN3_MODEL_OPTIONS = ["0.6B", "1.7B"]
+ELEVENLABS_MODEL_OPTIONS = ["scribe_v2", "scribe_v1"]
 
 # ── 색상/폰트 상수 ────────────────────────────────────────────────────────────
 BG = "#1e1e2e"
@@ -77,7 +79,7 @@ MODE_ALIGN = "정렬만"
 
 def _worker_generate(log_queue, resp_queue, media, output_folder,
                      lang_code, model_size, max_chars, save_txt,
-                     engine_id, qwen3_model):
+                     engine_id, qwen3_model, elevenlabs_model, elevenlabs_diarize):
     import warnings
     warnings.filterwarnings("ignore")
     from aligner import create_engine, transcribe_and_align
@@ -89,7 +91,13 @@ def _worker_generate(log_queue, resp_queue, media, output_folder,
         return resp_queue.get()
 
     try:
-        engine = create_engine(engine_id, model_size=model_size, qwen3_model=qwen3_model)
+        engine = create_engine(
+            engine_id,
+            model_size=model_size,
+            qwen3_model=qwen3_model,
+            elevenlabs_model=elevenlabs_model,
+            diarize=elevenlabs_diarize,
+        )
         transcribe_and_align(
             media_path=media,
             output_folder=output_folder,
@@ -160,6 +168,9 @@ class App(TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk):
         self._model_size = tk.StringVar(value="large-v3")
         self._qwen3_model = tk.StringVar(value="0.6B")
         self._together_api_key = tk.StringVar(value=self._config.get("together_api_key", ""))
+        self._elevenlabs_model = tk.StringVar(value="scribe_v2")
+        self._elevenlabs_api_key = tk.StringVar(value=self._config.get("elevenlabs_api_key", ""))
+        self._elevenlabs_diarize = tk.BooleanVar(value=False)
         self._split_enabled = tk.BooleanVar(value=True)
         self._max_chars = tk.IntVar(value=84)
         self._save_txt = tk.BooleanVar(value=False)
@@ -253,6 +264,35 @@ class App(TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk):
         )
         self._together_status_label.pack(side="left")
         self._refresh_together_status()
+
+        # ElevenLabs: 모델 dropdown + 화자 분리 토글 + 키 설정 버튼
+        self._elevenlabs_frame = tk.Frame(self._engine_frame, bg=BG)
+        self._elevenlabs_model_cb = ttk.Combobox(
+            self._elevenlabs_frame, textvariable=self._elevenlabs_model,
+            values=ELEVENLABS_MODEL_OPTIONS, state="readonly", font=FONT, width=10,
+        )
+        self._elevenlabs_model_cb.pack(side="left", padx=(0, 8))
+        tk.Checkbutton(
+            self._elevenlabs_frame, text="화자 분리",
+            variable=self._elevenlabs_diarize,
+            font=FONT, bg=BG, fg=FG,
+            selectcolor=BG2, activebackground=BG, activeforeground=ACCENT,
+        ).pack(side="left", padx=(0, 8))
+        self._elevenlabs_key_btn = tk.Button(
+            self._elevenlabs_frame, text="🔑 키 설정",
+            font=FONT, bg=BG2, fg=FG,
+            activebackground=ACCENT, activeforeground="#ffffff",
+            relief="flat", cursor="hand2", padx=8,
+            command=self._open_elevenlabs_key_dialog,
+        )
+        self._elevenlabs_key_btn.pack(side="left", padx=(0, 6))
+        self._elevenlabs_status_label = tk.Label(
+            self._elevenlabs_frame, text="",
+            font=FONT, bg=BG, fg=FG2,
+        )
+        self._elevenlabs_status_label.pack(side="left")
+        self._refresh_elevenlabs_status()
+
         # 기본 fasterwhisper → whisper 모델 dropdown 표시
         self._model_cb.pack(side="left")
         self._style_combobox()
@@ -421,17 +461,20 @@ class App(TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk):
             self._engine_frame.grid_remove()
 
     def _on_engine_change(self):
-        """엔진 콤보박스 변경 시 모델 dropdown / Together 키 입력 교체."""
+        """엔진 콤보박스 변경 시 모델 dropdown / API 키 입력 교체."""
         eng = self._engine_id()
         # 모두 unpack 후 해당 엔진 위젯만 표시
         self._model_cb.pack_forget()
         self._qwen3_model_cb.pack_forget()
         self._together_frame.pack_forget()
+        self._elevenlabs_frame.pack_forget()
 
         if eng == "qwen3":
             self._qwen3_model_cb.pack(side="left")
         elif eng == "together":
             self._together_frame.pack(side="left")
+        elif eng == "elevenlabs":
+            self._elevenlabs_frame.pack(side="left")
         else:  # fasterwhisper
             self._model_cb.pack(side="left")
 
@@ -524,6 +567,95 @@ class App(TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk):
         dlg.bind("<Return>", lambda e: on_save())
         dlg.bind("<Escape>", lambda e: on_cancel())
 
+    def _save_elevenlabs_key(self):
+        self._config["elevenlabs_api_key"] = self._elevenlabs_api_key.get().strip()
+        _save_config(self._config)
+        self._refresh_elevenlabs_status()
+
+    def _refresh_elevenlabs_status(self):
+        has_key = bool(self._elevenlabs_api_key.get().strip())
+        text = "✓ 키 설정됨" if has_key else "✗ 키 미설정"
+        color = SUCCESS if has_key else ERROR
+        self._elevenlabs_status_label.config(text=text, fg=color)
+
+    def _open_elevenlabs_key_dialog(self):
+        """ElevenLabs API 키 입력 모달 — 입력 → 저장 후 닫힘."""
+        dlg = tk.Toplevel(self)
+        dlg.title("ElevenLabs API 키 설정")
+        dlg.configure(bg=BG)
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        dlg.grab_set()
+
+        # 부모 창 기준 중앙 배치
+        self.update_idletasks()
+        px, py = self.winfo_rootx(), self.winfo_rooty()
+        pw, ph = self.winfo_width(), self.winfo_height()
+        dw, dh = 420, 200
+        dlg.geometry(f"{dw}x{dh}+{px + (pw - dw) // 2}+{py + (ph - dh) // 2}")
+
+        tk.Label(
+            dlg, text="ElevenLabs API 키",
+            font=FONT_BOLD, bg=BG, fg=FG,
+        ).pack(pady=(18, 4))
+        tk.Label(
+            dlg, text="https://elevenlabs.io/app/settings/api-keys 에서 발급",
+            font=("Malgun Gothic", 9), bg=BG, fg=FG2,
+        ).pack(pady=(0, 12))
+
+        local_var = tk.StringVar(value=self._elevenlabs_api_key.get())
+        show_var = tk.BooleanVar(value=False)
+
+        entry_frame = tk.Frame(dlg, bg=BG)
+        entry_frame.pack(pady=(0, 8))
+
+        entry = tk.Entry(
+            entry_frame, textvariable=local_var,
+            show="*", font=FONT, bg=BG2, fg=FG, insertbackground=FG,
+            relief="flat", width=38,
+        )
+        entry.pack(side="left", padx=(0, 6))
+        entry.focus_set()
+
+        def toggle_show():
+            entry.config(show="" if show_var.get() else "*")
+
+        tk.Checkbutton(
+            entry_frame, text="보이기",
+            variable=show_var, command=toggle_show,
+            font=("Malgun Gothic", 9), bg=BG, fg=FG2,
+            selectcolor=BG2, activebackground=BG, activeforeground=ACCENT,
+        ).pack(side="left")
+
+        btn_frame = tk.Frame(dlg, bg=BG)
+        btn_frame.pack(pady=(14, 18))
+
+        def on_save():
+            self._elevenlabs_api_key.set(local_var.get().strip())
+            self._save_elevenlabs_key()
+            dlg.destroy()
+
+        def on_cancel():
+            dlg.destroy()
+
+        tk.Button(
+            btn_frame, text="저장", font=FONT_BOLD,
+            bg=ACCENT, fg="#ffffff",
+            activebackground=ACCENT_HOVER, activeforeground="#ffffff",
+            relief="flat", cursor="hand2", padx=20, pady=6,
+            command=on_save,
+        ).pack(side="left", padx=6)
+        tk.Button(
+            btn_frame, text="취소", font=FONT,
+            bg=BG2, fg=FG2,
+            activebackground=ERROR, activeforeground="#ffffff",
+            relief="flat", cursor="hand2", padx=20, pady=6,
+            command=on_cancel,
+        ).pack(side="left", padx=6)
+
+        dlg.bind("<Return>", lambda e: on_save())
+        dlg.bind("<Escape>", lambda e: on_cancel())
+
     def _engine_id(self) -> str:
         return ENGINE_DISPLAY.get(self._engine.get(), "fasterwhisper")
 
@@ -584,6 +716,17 @@ class App(TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk):
             # worker(spawn) 프로세스가 상속받도록 부모 환경에 주입
             os.environ["TOGETHER_API_KEY"] = key
 
+        # ElevenLabs Scribe: 시작 전 키 확인 (입력란 → 환경변수 순)
+        if self._mode.get() == MODE_GENERATE and self._engine_id() == "elevenlabs":
+            key = self._elevenlabs_api_key.get().strip() or os.environ.get("ELEVENLABS_API_KEY", "").strip()
+            if not key:
+                messagebox.showerror(
+                    "오류",
+                    "ElevenLabs API 키가 없습니다.\n'🔑 키 설정' 버튼으로 입력하세요.",
+                )
+                return False
+            os.environ["ELEVENLABS_API_KEY"] = key
+
         return True
 
     def _start(self):
@@ -625,7 +768,8 @@ class App(TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk):
                       self._media_path.get(), self._output_folder.get(),
                       lang_code, self._model_size.get(),
                       max_chars, self._save_txt.get(),
-                      self._engine_id(), self._qwen3_model.get()),
+                      self._engine_id(), self._qwen3_model.get(),
+                      self._elevenlabs_model.get(), self._elevenlabs_diarize.get()),
                 daemon=True,
             )
         else:

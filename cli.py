@@ -3,10 +3,12 @@
 
 사용:
     python cli.py --input <video> --output <folder>
-                  [--engine fasterwhisper|qwen3|together] [--model large-v3]
-                  [--qwen3-model 0.6B] [--language auto] [--save-txt]
+                  [--engine fasterwhisper|qwen3|together|elevenlabs] [--model large-v3]
+                  [--qwen3-model 0.6B] [--elevenlabs-model scribe_v2]
+                  [--language auto] [--save-txt]
 
   together 엔진은 환경변수 TOGETHER_API_KEY 필요.
+  elevenlabs 엔진은 환경변수 ELEVENLABS_API_KEY 필요.
 
 stdout: 마지막 줄에 "RESULT: <SRT 절대경로>"
 stderr: 진행 로그, "[PROGRESS] <0~100>" 형식의 진행률
@@ -20,6 +22,7 @@ import sys
 from aligner import ENGINES, MODEL_OPTIONS, create_engine, transcribe_and_align
 
 QWEN3_MODEL_OPTIONS = ["0.6B", "1.7B"]
+ELEVENLABS_MODEL_OPTIONS = ["scribe_v2", "scribe_v1"]
 
 
 def main() -> int:
@@ -37,6 +40,15 @@ def main() -> int:
     parser.add_argument(
         "--qwen3-model", default="0.6B", choices=QWEN3_MODEL_OPTIONS,
         help="Qwen3-ASR 모델 (qwen3 엔진 전용, 기본: 0.6B)",
+    )
+    parser.add_argument(
+        "--elevenlabs-model", default="scribe_v2", choices=ELEVENLABS_MODEL_OPTIONS,
+        help="ElevenLabs Scribe 모델 (elevenlabs 엔진 전용, 기본: scribe_v2)",
+    )
+    parser.add_argument(
+        "--diarize", action="store_true",
+        help="화자 분리 활성 (elevenlabs 전용). 결과 자막에 'S1: ', 'S2: ' 프리픽스 부착. "
+             "실제로 1인 발화로 검출되면 프리픽스는 자동으로 생략됨.",
     )
     parser.add_argument(
         "--language", default="auto",
@@ -78,6 +90,8 @@ def main() -> int:
             args.engine,
             model_size=args.model,
             qwen3_model=args.qwen3_model,
+            elevenlabs_model=args.elevenlabs_model,
+            diarize=args.diarize,
         )
         transcribe_and_align(
             media_path=args.input,

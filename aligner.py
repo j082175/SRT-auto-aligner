@@ -719,10 +719,13 @@ class EngineResult:
     detected_language: 입력받았거나 엔진이 감지한 언어 코드 (예: "en")
     replacements_list: align_to_srt에서 wav2vec2 정확도 향상용 숫자→단어 트릭 산물.
         transcribe에선 빈 리스트, mode 2에선 세그먼트별 (단어, 원본숫자) 리스트.
+    diarize: 화자 분리가 활성화되어 words에 speaker_id가 담겨 있는지 여부. host가 split
+        후 _apply_speaker_prefixes를 호출할지 결정할 때 사용.
     """
     segments: List[dict]
     detected_language: str
     replacements_list: list = field(default_factory=list)
+    diarize: bool = False
 
 
 class BaseEngine(ABC):
@@ -1296,10 +1299,259 @@ class TogetherEngine(BaseEngine):
 
 
 # ------------------------------------------------------------
+# ElevenLabs Scribe (cloud transcription)
+# ------------------------------------------------------------
+
+# ISO-639-3 → ISO-639-1 (Scribe 응답 정규화 — 다른 엔진과 동일한 2글자 코드로 통일)
+_ISO3_TO_ISO1 = {
+    "eng": "en", "kor": "ko", "jpn": "ja",
+    "zho": "zh", "cmn": "zh", "yue": "zh",
+    "spa": "es", "fra": "fr", "deu": "de", "rus": "ru",
+    "por": "pt", "ita": "it", "ara": "ar",
+}
+
+
+def _normalize_lang_code(code: Optional[str], fallback: str) -> str:
+    if not code:
+        return fallback
+    c = code.lower()
+    if len(c) == 2:
+        return c
+    return _ISO3_TO_ISO1.get(c, fallback)
+
+
+def _normalize_token_unicode(token: str) -> str:
+    """Unicode 인식 normalize: 모든 letter/digit 유지, 나머지 제거 후 소문자.
+
+    Qwen3용 _normalize_token은 [a-z0-9가-힣]만 유지해서 일본어·중국어·키릴 등이
+    누락되는 문제가 있어, 다국어 엔진(Scribe)용으로 분리.
+    """
+    return "".join(c.lower() for c in token if c.isalnum())
+
+
+def _convert_scribe_to_segments(text: str, words: List[dict]) -> List[dict]:
+    """Scribe 출력(전체 텍스트 + word 항목)을 WhisperX 호환 segment 리스트로 변환.
+
+    Scribe 응답 words는 type ∈ {word, spacing, audio_event}. 그중 type=="word"만 사용.
+    텍스트는 punctuation 포함, word.text는 단어만 → unicode-aware normalize 매칭으로
+    문장 단어와 정렬. diarize=true 응답의 speaker_id는 matched word에 그대로 실어
+    split_long_segments 이후에도 화자 정보가 보존되게 함.
+    """
+    word_items = [
+        {
+            "text": w.get("text", ""),
+            "start": w.get("start"),
+            "end": w.get("end"),
+            "speaker_id": w.get("speaker_id"),
+        }
+        for w in words
+        if w.get("type") == "word"
+        and w.get("start") is not None
+        and w.get("end") is not None
+    ]
+    if not word_items:
+        return []
+
+    sentences = re.split(r"(?<=[.!?])\s+", text.strip())
+    sentences = [s for s in sentences if s.strip()]
+
+    word_idx = 0
+    segments: List[dict] = []
+    for sentence in sentences:
+        sent_tokens = sentence.split()
+        if not sent_tokens:
+            continue
+
+        matched: List[dict] = []
+        for st in sent_tokens:
+            st_norm = _normalize_token_unicode(st)
+            if not st_norm:
+                continue
+            # 최대 5단어 안에서 정렬 단어 찾기 (구두점·접속어 등으로 어긋날 여지)
+            search_limit = min(word_idx + 5, len(word_items))
+            for j in range(word_idx, search_limit):
+                if _normalize_token_unicode(word_items[j]["text"]) == st_norm:
+                    matched.append({
+                        "word": st,  # 원본 토큰 (punctuation 포함)
+                        "start": word_items[j]["start"],
+                        "end": word_items[j]["end"],
+                        "speaker_id": word_items[j].get("speaker_id"),
+                    })
+                    word_idx = j + 1
+                    break
+
+        if not matched:
+            continue
+
+        segments.append({
+            "start": matched[0]["start"],
+            "end": matched[-1]["end"],
+            "text": sentence,
+            "words": matched,
+        })
+
+    return segments
+
+
+def _apply_speaker_prefixes(segments: List[dict]) -> List[dict]:
+    """diarize 결과 segments의 텍스트에 'S1: ' / 'S2: ' 프리픽스 부착.
+
+    각 segment의 words 배열에 담긴 speaker_id를 카운트해 dominant 화자를 결정하므로
+    split_long_segments로 잘려나간 sub-segment도 자신의 단어 구성을 보고 라벨을 받음.
+    검출된 화자가 1명 이하면 프리픽스 자체를 생략 (잡음 방지) — Scribe가 화자를 못 가른
+    경우나 사용자가 토글만 켰는데 실제로는 1인 발화인 경우 모두 해당.
+
+    라벨 인덱스는 전체 segments에 걸쳐 화자 ID 첫 등장 순서로 1, 2, 3… 부여.
+    """
+    speaker_map: dict = {}
+    for seg in segments:
+        for w in seg.get("words", []):
+            sid = w.get("speaker_id")
+            if sid and sid not in speaker_map:
+                speaker_map[sid] = f"S{len(speaker_map) + 1}"
+
+    if len(speaker_map) <= 1:
+        return segments
+
+    for seg in segments:
+        words = seg.get("words", [])
+        if not words:
+            continue
+        counts: dict = {}
+        for w in words:
+            sid = w.get("speaker_id")
+            if sid:
+                counts[sid] = counts.get(sid, 0) + 1
+        if not counts:
+            continue
+        dominant = max(counts, key=counts.get)
+        label = speaker_map.get(dominant)
+        text = (seg.get("text") or "").strip()
+        if label and text:
+            seg["text"] = f"{label}: {text}"
+
+    return segments
+
+
+class ElevenLabsScribeEngine(BaseEngine):
+    """ElevenLabs Scribe (v1/v2) 클라우드 ASR.
+
+    - ELEVENLABS_API_KEY 환경변수 필요
+    - 다국어 ASR 벤치마크 상위권, hallucination이 Whisper보다 적고 punctuation 안정적
+    - mode 2 미지원 — Scribe API에 forced alignment 엔드포인트가 없어 새 전사만 가능
+    - 파일 한도 3GB / 26시간이라 청크 분할 불필요 (extract_audio가 만드는 16kHz mono PCM 기준)
+    """
+    name: ClassVar[str] = "elevenlabs"
+    supports_align_to_srt: ClassVar[bool] = False
+
+    API_URL: ClassVar[str] = "https://api.elevenlabs.io/v1/speech-to-text"
+
+    def __init__(self, model: str = "scribe_v2", diarize: bool = False):
+        if model not in ("scribe_v1", "scribe_v2"):
+            raise ValueError(f"ElevenLabs 모델은 scribe_v1 또는 scribe_v2만 가능: {model}")
+        self.model = model
+        self.diarize = diarize
+
+    def transcribe(self, audio_path, language_code, log, progress):
+        api_key = os.environ.get("ELEVENLABS_API_KEY")
+        if not api_key:
+            raise RuntimeError(
+                "ELEVENLABS_API_KEY 환경변수가 없습니다. "
+                "https://elevenlabs.io/app/settings/api-keys 에서 발급받아 설정하세요."
+            )
+
+        # 업로드/처리 동안 진행률을 시간 기반 전진시키기 위한 길이 추정.
+        # extract_audio가 16kHz mono 16-bit PCM WAV로 만들므로 32000 bytes/sec.
+        try:
+            duration = max(os.path.getsize(audio_path) / 32000, 5.0)
+        except OSError:
+            duration = 60.0
+
+        size_mb = os.path.getsize(audio_path) / 1_048_576
+        diarize_tag = " · 화자 분리 ON" if self.diarize else ""
+        log(f"ElevenLabs Scribe 업로드 중 ({self.model}{diarize_tag}, {size_mb:.1f}MB)...")
+        progress(20)
+
+        # 백그라운드: 20→85% 구간을 처리 예상시간(영상 길이의 약 0.3배) 기준 전진
+        _done = threading.Event()
+        def _advance():
+            t0 = time.time()
+            target_secs = max(duration * 0.3, 10.0)
+            while not _done.is_set():
+                frac = min((time.time() - t0) / target_secs, 0.95)
+                progress(20 + frac * 65)
+                time.sleep(0.5)
+        threading.Thread(target=_advance, daemon=True).start()
+
+        try:
+            form: List[tuple] = [
+                ("model_id", self.model),
+                ("timestamps_granularity", "word"),
+                ("tag_audio_events", "false"),  # 자막에 [laughter] 같은 라벨 끼는 것 방지
+                ("file_format", "pcm_s16le_16"),  # extract_audio 출력 포맷과 일치
+                ("diarize", "true" if self.diarize else "false"),
+            ]
+            if language_code:
+                form.append(("language_code", language_code))
+
+            with open(audio_path, "rb") as f:
+                resp = requests.post(
+                    self.API_URL,
+                    headers={"xi-api-key": api_key},
+                    files={"file": (os.path.basename(audio_path), f, "audio/wav")},
+                    data=form,
+                    timeout=1800,  # 장시간 영상까지 커버 (30분)
+                )
+        finally:
+            _done.set()
+
+        if resp.status_code != 200:
+            body = resp.text[:500]
+            raise RuntimeError(f"ElevenLabs API 실패 (status {resp.status_code}): {body}")
+
+        data = resp.json()
+        text = (data.get("text") or "").strip()
+        words = data.get("words") or []
+        detected_lang = _normalize_lang_code(
+            data.get("language_code"), language_code or "en",
+        )
+
+        log(
+            f"전사 완료. 언어: {detected_lang} | "
+            f"text {len(text)}자, word {len(words)}개"
+        )
+        progress(88)
+
+        segments = _convert_scribe_to_segments(text, words)
+        if not segments:
+            raise RuntimeError(
+                f"ElevenLabs 응답에서 segment를 추출하지 못했습니다. "
+                f"text 길이={len(text)}, words={len(words)}"
+            )
+
+        log(f"Segment {len(segments)}개 변환 완료.")
+        progress(95)
+
+        return EngineResult(
+            segments=segments,
+            detected_language=detected_lang,
+            replacements_list=[],
+            diarize=self.diarize,
+        )
+
+    def align_to_srt(self, audio_path, srt_segments, language_code, log, progress):
+        raise NotImplementedError(
+            "ElevenLabs 엔진은 mode 2 (기존 SRT 재정렬)를 지원하지 않습니다. "
+            "Scribe API에 alignment 엔드포인트가 없어 새 전사만 가능합니다. "
+            "기존 SRT 재정렬에는 FasterWhisper 엔진을 사용하세요."
+        )
+
+
+# ------------------------------------------------------------
 # 엔진 팩토리
 # ------------------------------------------------------------
 
-ENGINES: List[str] = ["fasterwhisper", "qwen3", "together"]
+ENGINES: List[str] = ["fasterwhisper", "qwen3", "together", "elevenlabs"]
 
 
 def create_engine(name: str, **kwargs) -> BaseEngine:
@@ -1308,6 +1560,8 @@ def create_engine(name: str, **kwargs) -> BaseEngine:
     fasterwhisper: model_size (str)
     qwen3:         qwen3_model (str: "0.6B" | "1.7B")
     together:      together_model (str, 기본 "openai/whisper-large-v3")
+    elevenlabs:    elevenlabs_model (str: "scribe_v2" | "scribe_v1", 기본 "scribe_v2")
+                   diarize (bool, 기본 False) — 화자 분리 활성, segment 텍스트에 "S1: " 프리픽스
     """
     name = (name or "").lower()
     if name == "fasterwhisper":
@@ -1316,6 +1570,11 @@ def create_engine(name: str, **kwargs) -> BaseEngine:
         return Qwen3Engine(model=kwargs.get("qwen3_model", "0.6B"))
     if name == "together":
         return TogetherEngine(model=kwargs.get("together_model", "openai/whisper-large-v3"))
+    if name == "elevenlabs":
+        return ElevenLabsScribeEngine(
+            model=kwargs.get("elevenlabs_model", "scribe_v2"),
+            diarize=kwargs.get("diarize", False),
+        )
     raise ValueError(f"지원되지 않는 엔진: {name} (사용 가능: {ENGINES})")
 
 
@@ -1359,6 +1618,11 @@ def transcribe_and_align(
             log(f"긴 자막 분할 중 (최대 {max_chars}자)...")
             nlp = load_spacy_model(detected_lang, log)
             out_segments = split_long_segments(out_segments, max_chars, nlp)
+
+        # 화자 프리픽스는 split 이후에 부착 — split된 sub-segment도 자신의 words를 보고
+        # 라벨을 받으므로 긴 발화가 잘려도 모든 줄에 "S1: " 등이 유지됨.
+        if result.diarize:
+            out_segments = _apply_speaker_prefixes(out_segments)
 
         segments = _wx_segments_to_srt(out_segments)
         segments = collapse_numbers_in_srt(segments, result.replacements_list)
