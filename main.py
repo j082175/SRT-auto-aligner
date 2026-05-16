@@ -159,21 +159,41 @@ class App(TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk):
 
         self._config = _load_config()
 
-        self._mode = tk.StringVar(value=MODE_GENERATE)
+        # 이전 세션 상태 복원 — 잘못된 값/허용 목록 밖이면 기본값으로 fallback.
+        # media_path / srt_path는 의도적으로 복원하지 않음 (영상마다 새로 선택)
+        cfg = self._config
+
+        def _pick_str(key, default, allowed):
+            v = cfg.get(key)
+            return v if isinstance(v, str) and v in allowed else default
+
+        def _pick_bool(key, default):
+            v = cfg.get(key)
+            return v if isinstance(v, bool) else default
+
+        def _pick_int(key, default, min_v, max_v):
+            v = cfg.get(key)
+            return v if isinstance(v, int) and min_v <= v <= max_v else default
+
+        out_folder = cfg.get("output_folder", "")
+        if not isinstance(out_folder, str):
+            out_folder = ""
+
+        self._mode = tk.StringVar(value=_pick_str("mode", MODE_GENERATE, {MODE_GENERATE, MODE_ALIGN}))
         self._media_path = tk.StringVar()
         self._srt_path = tk.StringVar()
-        self._output_folder = tk.StringVar()
-        self._language = tk.StringVar(value="자동 감지")
-        self._engine = tk.StringVar(value="FasterWhisper")
-        self._model_size = tk.StringVar(value="large-v3")
-        self._qwen3_model = tk.StringVar(value="0.6B")
-        self._together_api_key = tk.StringVar(value=self._config.get("together_api_key", ""))
-        self._elevenlabs_model = tk.StringVar(value="scribe_v2")
-        self._elevenlabs_api_key = tk.StringVar(value=self._config.get("elevenlabs_api_key", ""))
-        self._elevenlabs_diarize = tk.BooleanVar(value=False)
-        self._split_enabled = tk.BooleanVar(value=True)
-        self._max_chars = tk.IntVar(value=84)
-        self._save_txt = tk.BooleanVar(value=False)
+        self._output_folder = tk.StringVar(value=out_folder)
+        self._language = tk.StringVar(value=_pick_str("language", "자동 감지", set(LANGUAGE_OPTIONS.keys())))
+        self._engine = tk.StringVar(value=_pick_str("engine", "FasterWhisper", set(ENGINE_DISPLAY.keys())))
+        self._model_size = tk.StringVar(value=_pick_str("model_size", "large-v3", set(MODEL_OPTIONS)))
+        self._qwen3_model = tk.StringVar(value=_pick_str("qwen3_model", "0.6B", set(QWEN3_MODEL_OPTIONS)))
+        self._together_api_key = tk.StringVar(value=cfg.get("together_api_key", ""))
+        self._elevenlabs_model = tk.StringVar(value=_pick_str("elevenlabs_model", "scribe_v2", set(ELEVENLABS_MODEL_OPTIONS)))
+        self._elevenlabs_api_key = tk.StringVar(value=cfg.get("elevenlabs_api_key", ""))
+        self._elevenlabs_diarize = tk.BooleanVar(value=_pick_bool("elevenlabs_diarize", False))
+        self._split_enabled = tk.BooleanVar(value=_pick_bool("split_enabled", True))
+        self._max_chars = tk.IntVar(value=_pick_int("max_chars", 84, 20, 120))
+        self._save_txt = tk.BooleanVar(value=_pick_bool("save_txt", False))
 
         self._log_queue: multiprocessing.Queue = multiprocessing.Queue()
         self._resp_queue: multiprocessing.Queue = multiprocessing.Queue()
@@ -184,8 +204,12 @@ class App(TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk):
         self._timer_after_id = None
 
         self._build_ui()
+        self._apply_engine_view()  # 복원된 engine에 맞춰 모델/키 위젯 동기화
         self._on_mode_change()
         self._poll_log()
+
+        # 창 닫기 시 설정 저장
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ── UI 빌드 ───────────────────────────────────────────────────────────────
 
@@ -293,8 +317,7 @@ class App(TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk):
         self._elevenlabs_status_label.pack(side="left")
         self._refresh_elevenlabs_status()
 
-        # 기본 fasterwhisper → whisper 모델 dropdown 표시
-        self._model_cb.pack(side="left")
+        # 초기 엔진에 맞는 위젯은 _apply_engine_view가 __init__에서 호출되어 처리
         self._style_combobox()
 
 
@@ -460,16 +483,12 @@ class App(TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk):
             self._model_label.grid_remove()
             self._engine_frame.grid_remove()
 
-    def _on_engine_change(self):
-        """엔진 콤보박스 변경 시 모델 dropdown / API 키 입력 교체.
+    def _apply_engine_view(self):
+        """현재 _engine 값에 맞춰 모델 dropdown / API 키 위젯만 교체 (max_chars 불변).
 
-        엔진별 권장 max_chars도 자동 적용 (사용자가 후속 수정 가능):
-          - ElevenLabs Scribe: 42자 (BBC/Netflix 표준) — Scribe sentence segment가
-            한 화면 자막으로 너무 길어지는 것 방지
-          - 그 외: 84자 (기존 기본)
+        초기 로드 시 호출하면 저장된 max_chars를 덮어쓰지 않고 UI만 동기화 가능.
         """
         eng = self._engine_id()
-        # 모두 unpack 후 해당 엔진 위젯만 표시
         self._model_cb.pack_forget()
         self._qwen3_model_cb.pack_forget()
         self._together_frame.pack_forget()
@@ -484,7 +503,16 @@ class App(TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk):
         else:  # fasterwhisper
             self._model_cb.pack(side="left")
 
-        self._max_chars.set(42 if eng == "elevenlabs" else 84)
+    def _on_engine_change(self):
+        """엔진 콤보박스를 사용자가 직접 바꿨을 때: UI 교체 + 권장 max_chars 자동 적용.
+
+        엔진별 권장값 (사용자가 후속 수정 가능):
+          - ElevenLabs Scribe: 42자 (BBC/Netflix 표준) — Scribe sentence segment가
+            한 화면 자막으로 너무 길어지는 것 방지
+          - 그 외: 84자 (기존 기본)
+        """
+        self._apply_engine_view()
+        self._max_chars.set(42 if self._engine_id() == "elevenlabs" else 84)
 
     def _save_together_key(self):
         self._config["together_api_key"] = self._together_api_key.get().strip()
@@ -664,6 +692,29 @@ class App(TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk):
         dlg.bind("<Return>", lambda e: on_save())
         dlg.bind("<Escape>", lambda e: on_cancel())
 
+    def _save_ui_settings(self):
+        """현재 UI 상태를 config.json에 저장 (API 키 등 다른 키는 보존).
+
+        창 종료 시점과 _start 진입 시점에 호출 — 작업 도중 크래시가 나도 직전 설정은
+        남아 있게 함.
+        """
+        self._config["mode"] = self._mode.get()
+        self._config["engine"] = self._engine.get()
+        self._config["model_size"] = self._model_size.get()
+        self._config["qwen3_model"] = self._qwen3_model.get()
+        self._config["elevenlabs_model"] = self._elevenlabs_model.get()
+        self._config["elevenlabs_diarize"] = self._elevenlabs_diarize.get()
+        self._config["language"] = self._language.get()
+        self._config["split_enabled"] = self._split_enabled.get()
+        self._config["max_chars"] = self._max_chars.get()
+        self._config["save_txt"] = self._save_txt.get()
+        self._config["output_folder"] = self._output_folder.get()
+        _save_config(self._config)
+
+    def _on_close(self):
+        self._save_ui_settings()
+        self.destroy()
+
     def _engine_id(self) -> str:
         return ENGINE_DISPLAY.get(self._engine.get(), "fasterwhisper")
 
@@ -740,6 +791,9 @@ class App(TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk):
     def _start(self):
         if self._running or not self._validate():
             return
+
+        # 작업 시작 직전 상태 저장 — 도중에 크래시가 나도 직전 설정은 다음 실행에 반영
+        self._save_ui_settings()
 
         lang_code = LANGUAGE_OPTIONS.get(self._language.get())
 
