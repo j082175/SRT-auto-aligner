@@ -721,11 +721,15 @@ class EngineResult:
         transcribe에선 빈 리스트, mode 2에선 세그먼트별 (단어, 원본숫자) 리스트.
     diarize: 화자 분리가 활성화되어 words에 speaker_id가 담겨 있는지 여부. host가 split
         후 _apply_speaker_prefixes를 호출할지 결정할 때 사용.
+    extend_display_time: word.end가 발화 종료에 너무 타이트해 자막이 깜빡이는 엔진(예:
+        ElevenLabs Scribe)에서 True. host가 split + speaker prefix 후 _extend_display_time
+        을 적용하도록 신호.
     """
     segments: List[dict]
     detected_language: str
     replacements_list: list = field(default_factory=list)
     diarize: bool = False
+    extend_display_time: bool = False
 
 
 class BaseEngine(ABC):
@@ -1433,6 +1437,63 @@ def _apply_speaker_prefixes(segments: List[dict]) -> List[dict]:
     return segments
 
 
+def _extend_display_time(
+    segments: List[dict],
+    min_duration: float = 1.2,
+    max_duration: float = 6.0,
+    reading_cps: float = 15.0,
+    gap_fill_threshold: float = 0.3,
+) -> List[dict]:
+    """짧은 자막의 표시 시간을 reading speed 기준으로 연장 + 짧은 갭 메움.
+
+    Scribe의 word.end가 발화 종료에 너무 타이트해 "What?" 같은 짧은 자막이 0.04초만
+    보이는 문제 보정. 플러그인(JSCEditHelper) 정책과 동일:
+      - reading_time = max(MIN_DURATION, len(text) / READING_CPS)
+      - natural_end  = start + min(reading_time, MAX_DURATION)
+      - cap          = next.start (없으면 natural_end)
+      - new_end      = min(natural_end, cap)
+      - gap fill: next까지 갭이 GAP_FILL_THRESHOLD 미만이면 cap까지 당김 (자막 깜빡임 제거)
+
+    new_end > 기존 end일 때만 적용 — 원본이 이미 충분히 길면 그대로 둠.
+    READING_CPS=15는 한국어(~12)와 영어(~17)의 중간값.
+    """
+    if not segments:
+        return segments
+
+    result = [dict(s) for s in segments]
+    for i, seg in enumerate(result):
+        start = seg.get("start")
+        end = seg.get("end")
+        text = (seg.get("text") or "").strip()
+        if start is None or end is None or not text:
+            continue
+
+        reading_time = max(min_duration, len(text) / reading_cps)
+        natural_end = start + min(reading_time, max_duration)
+
+        next_start = None
+        if i + 1 < len(result):
+            ns = result[i + 1].get("start")
+            if ns is not None:
+                next_start = ns
+
+        cap = next_start if next_start is not None else natural_end
+        new_end = min(natural_end, cap)
+
+        # 짧은 자연 침묵 메우기 — 다음 자막까지 거리가 짧으면 cap까지 늘려 깜빡임 제거
+        if (
+            next_start is not None
+            and cap > new_end
+            and (next_start - new_end) < gap_fill_threshold
+        ):
+            new_end = cap
+
+        if new_end > end:
+            seg["end"] = new_end
+
+    return result
+
+
 class ElevenLabsScribeEngine(BaseEngine):
     """ElevenLabs Scribe (v1/v2) 클라우드 ASR.
 
@@ -1537,6 +1598,7 @@ class ElevenLabsScribeEngine(BaseEngine):
             detected_language=detected_lang,
             replacements_list=[],
             diarize=self.diarize,
+            extend_display_time=True,
         )
 
     def align_to_srt(self, audio_path, srt_segments, language_code, log, progress):
@@ -1623,6 +1685,10 @@ def transcribe_and_align(
         # 라벨을 받으므로 긴 발화가 잘려도 모든 줄에 "S1: " 등이 유지됨.
         if result.diarize:
             out_segments = _apply_speaker_prefixes(out_segments)
+
+        # 표시 시간 연장 — speaker prefix가 추가된 텍스트 길이까지 반영해 reading time 계산
+        if result.extend_display_time:
+            out_segments = _extend_display_time(out_segments)
 
         segments = _wx_segments_to_srt(out_segments)
         segments = collapse_numbers_in_srt(segments, result.replacements_list)

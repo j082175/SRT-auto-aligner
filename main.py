@@ -461,7 +461,13 @@ class App(TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk):
             self._engine_frame.grid_remove()
 
     def _on_engine_change(self):
-        """엔진 콤보박스 변경 시 모델 dropdown / API 키 입력 교체."""
+        """엔진 콤보박스 변경 시 모델 dropdown / API 키 입력 교체.
+
+        엔진별 권장 max_chars도 자동 적용 (사용자가 후속 수정 가능):
+          - ElevenLabs Scribe: 42자 (BBC/Netflix 표준) — Scribe sentence segment가
+            한 화면 자막으로 너무 길어지는 것 방지
+          - 그 외: 84자 (기존 기본)
+        """
         eng = self._engine_id()
         # 모두 unpack 후 해당 엔진 위젯만 표시
         self._model_cb.pack_forget()
@@ -477,6 +483,8 @@ class App(TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk):
             self._elevenlabs_frame.pack(side="left")
         else:  # fasterwhisper
             self._model_cb.pack(side="left")
+
+        self._max_chars.set(42 if eng == "elevenlabs" else 84)
 
     def _save_together_key(self):
         self._config["together_api_key"] = self._together_api_key.get().strip()
