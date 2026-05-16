@@ -1397,6 +1397,105 @@ def _convert_scribe_to_segments(text: str, words: List[dict]) -> List[dict]:
     return segments
 
 
+def _segments_from_word_stream(
+    words: List[dict],
+    max_chars: int = 42,
+    pause_threshold: float = 0.7,
+    max_duration: float = 6.0,
+) -> List[dict]:
+    """Scribe words를 직접 walk해 segment 생성 (text 기반 매칭이 0개일 때 폴백).
+
+    text-based 분할이 통하지 않는 언어(일본어/중국어/구두점 없는 가사)를 위한 안전망.
+    spacing 토큰의 text(공백/구두점)도 누적해 영어 공백/일본어 무공백 모두 자연스러운
+    segment text 구성. 분할 트리거:
+      - word 사이 침묵 ≥ pause_threshold
+      - buf 누적 길이 ≥ max_duration
+      - word.text 끝이 [.!?。！？…] 문장 종결
+      - 누적 텍스트 글자 수 ≥ max_chars
+
+    플러그인(JSCEditHelper) buildEntriesFromWords 정책 중 핵심만 차용한 간소화 버전.
+    """
+    sentence_end_re = re.compile(r"[.!?。！？…]$")
+
+    segments: List[dict] = []
+    buf_text: List[str] = []
+    buf_words: List[dict] = []  # type=="word"만
+    buf_start: Optional[float] = None
+    buf_end: Optional[float] = None
+    last_word_end: Optional[float] = None
+
+    def flush():
+        nonlocal buf_text, buf_words, buf_start, buf_end
+        if buf_words and buf_start is not None and buf_end is not None:
+            text = "".join(buf_text).strip()
+            if text:
+                segments.append({
+                    "start": buf_start,
+                    "end": buf_end,
+                    "text": text,
+                    "words": [
+                        {
+                            "word": ww.get("text", ""),
+                            "start": ww.get("start"),
+                            "end": ww.get("end"),
+                            "speaker_id": ww.get("speaker_id"),
+                        }
+                        for ww in buf_words
+                    ],
+                })
+        buf_text = []
+        buf_words = []
+        buf_start = None
+        buf_end = None
+
+    for w in words:
+        wtype = w.get("type")
+        wtext = w.get("text", "")
+        wstart = w.get("start")
+        wend = w.get("end")
+
+        if wtype == "audio_event":
+            continue
+        if not isinstance(wtext, str) or not wtext:
+            continue
+
+        is_word = (wtype == "word")
+        if is_word and (wstart is None or wend is None):
+            continue
+
+        # buf 비어있는 상태에서 spacing 먼저 오면 skip — buf_start는 첫 word.start로 잡아야
+        # 자막이 발화보다 일찍 표시되는 것을 막음 (Scribe spacing.start = 직전 word.end)
+        if not buf_words and not is_word:
+            continue
+
+        # word 진입 시 침묵/길이 분할 검사
+        if is_word and buf_words:
+            silence = (wstart - last_word_end) if last_word_end is not None else 0.0
+            duration = (wend - buf_start) if buf_start is not None else 0.0
+            if silence >= pause_threshold or duration >= max_duration:
+                flush()
+
+        if buf_start is None and is_word:
+            buf_start = wstart
+
+        buf_text.append(wtext)
+        if is_word:
+            buf_words.append(w)
+            buf_end = wend
+            last_word_end = wend
+
+        # 문장 종결 부호 또는 max_chars 도달 시 flush.
+        # word(일/중: `。` 등이 word.text에 포함) + spacing(영: `. ` 등이 spacing에 포함)
+        # 양쪽에서 검사해 언어 무관하게 작동.
+        if sentence_end_re.search(wtext.strip()):
+            flush()
+        elif len("".join(buf_text).strip()) >= max_chars:
+            flush()
+
+    flush()
+    return segments
+
+
 def _apply_speaker_prefixes(segments: List[dict]) -> List[dict]:
     """diarize 결과 segments의 텍스트에 'S1: ' / 'S2: ' 프리픽스 부착.
 
@@ -1584,6 +1683,11 @@ class ElevenLabsScribeEngine(BaseEngine):
         progress(88)
 
         segments = _convert_scribe_to_segments(text, words)
+        if not segments:
+            # text-based 매칭은 공백+ASCII 구두점 기반이라 일본어/중국어/구두점 없는
+            # 가사에서 0개가 나옴. word stream을 직접 walk하는 폴백으로 재시도.
+            log("문장 단위 매칭 0개 → word stream 폴백 적용 (CJK/가사용).")
+            segments = _segments_from_word_stream(words)
         if not segments:
             raise RuntimeError(
                 f"ElevenLabs 응답에서 segment를 추출하지 못했습니다. "
