@@ -11,7 +11,10 @@ import multiprocessing
 import os
 import queue
 import sys
+import threading
 import time
+
+import requests
 
 # pythonw.exe 실행 시 stdout/stderr가 None이라 huggingface/tqdm 등의 print가 죽음
 if sys.stdout is None:
@@ -198,10 +201,13 @@ class App(TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk):
         self._running = False
         self._start_time: float = 0.0
         self._timer_after_id = None
+        self._elevenlabs_quota_text = ""
 
         self._build_ui()
         self._apply_engine_view()  # 복원된 engine에 맞춰 모델/키 위젯 동기화
         self._on_mode_change()
+        if self._engine_id() == "elevenlabs":
+            self._refresh_elevenlabs_quota()
         self._poll_log()
 
         # 창 닫기 시 설정 저장
@@ -249,23 +255,29 @@ class App(TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk):
         self._engine_frame = tk.Frame(self, bg=BG)
         self._engine_frame.grid(row=6, column=1, columnspan=2, sticky="w", padx=(0, 18), pady=5)
 
+        # engine_frame은 2행 — row1 = 엔진 + 모델, row2 = ElevenLabs 옵션(엔진 선택 시만)
+        self._engine_row1 = tk.Frame(self._engine_frame, bg=BG)
+        self._engine_row1.pack(anchor="w")
+        self._engine_row2 = tk.Frame(self._engine_frame, bg=BG)
+        # row2는 _apply_engine_view에서 ElevenLabs일 때만 pack
+
         self._engine_cb = ttk.Combobox(
-            self._engine_frame, textvariable=self._engine,
+            self._engine_row1, textvariable=self._engine,
             values=list(ENGINE_DISPLAY.keys()), state="readonly", font=FONT, width=12,
         )
         self._engine_cb.pack(side="left", padx=(0, 8))
         self._engine_cb.bind("<<ComboboxSelected>>", lambda e: self._on_engine_change())
 
         self._model_cb = ttk.Combobox(
-            self._engine_frame, textvariable=self._model_size,
+            self._engine_row1, textvariable=self._model_size,
             values=MODEL_OPTIONS, state="readonly", font=FONT, width=12,
         )
         self._qwen3_model_cb = ttk.Combobox(
-            self._engine_frame, textvariable=self._qwen3_model,
+            self._engine_row1, textvariable=self._qwen3_model,
             values=QWEN3_MODEL_OPTIONS, state="readonly", font=FONT, width=12,
         )
         # Together API: 모델 고정 + 키 설정 버튼 (모달에서 입력 → config.json에 저장)
-        self._together_frame = tk.Frame(self._engine_frame, bg=BG)
+        self._together_frame = tk.Frame(self._engine_row1, bg=BG)
         tk.Label(
             self._together_frame, text="whisper-large-v3",
             font=FONT, bg=BG, fg=FG2,
@@ -285,21 +297,23 @@ class App(TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk):
         self._together_status_label.pack(side="left")
         self._refresh_together_status()
 
-        # ElevenLabs: 모델 dropdown + 화자 분리 토글 + 키 설정 버튼
-        self._elevenlabs_frame = tk.Frame(self._engine_frame, bg=BG)
+        # ElevenLabs: row1 = 모델 dropdown만, row2 = 화자 분리 + 키 설정 + 잔액 (engine_row2 사용)
+        self._elevenlabs_frame = tk.Frame(self._engine_row1, bg=BG)
         self._elevenlabs_model_cb = ttk.Combobox(
             self._elevenlabs_frame, textvariable=self._elevenlabs_model,
             values=ELEVENLABS_MODEL_OPTIONS, state="readonly", font=FONT, width=10,
         )
-        self._elevenlabs_model_cb.pack(side="left", padx=(0, 8))
+        self._elevenlabs_model_cb.pack(side="left")
+
+        self._elevenlabs_options_frame = tk.Frame(self._engine_row2, bg=BG)
         tk.Checkbutton(
-            self._elevenlabs_frame, text="화자 분리",
+            self._elevenlabs_options_frame, text="화자 분리",
             variable=self._elevenlabs_diarize,
             font=FONT, bg=BG, fg=FG,
             selectcolor=BG2, activebackground=BG, activeforeground=ACCENT,
         ).pack(side="left", padx=(0, 8))
         self._elevenlabs_key_btn = tk.Button(
-            self._elevenlabs_frame, text="🔑 키 설정",
+            self._elevenlabs_options_frame, text="🔑 키 설정",
             font=FONT, bg=BG2, fg=FG,
             activebackground=ACCENT, activeforeground="#ffffff",
             relief="flat", cursor="hand2", padx=8,
@@ -307,10 +321,11 @@ class App(TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk):
         )
         self._elevenlabs_key_btn.pack(side="left", padx=(0, 6))
         self._elevenlabs_status_label = tk.Label(
-            self._elevenlabs_frame, text="",
+            self._elevenlabs_options_frame, text="",
             font=FONT, bg=BG, fg=FG2,
         )
         self._elevenlabs_status_label.pack(side="left")
+        self._elevenlabs_options_frame.pack(side="left")
         self._refresh_elevenlabs_status()
 
         # 초기 엔진에 맞는 위젯은 _apply_engine_view가 __init__에서 호출되어 처리
@@ -490,12 +505,15 @@ class App(TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk):
         self._together_frame.pack_forget()
         self._elevenlabs_frame.pack_forget()
 
+        self._engine_row2.pack_forget()
+
         if eng == "qwen3":
             self._qwen3_model_cb.pack(side="left")
         elif eng == "together":
             self._together_frame.pack(side="left")
         elif eng == "elevenlabs":
             self._elevenlabs_frame.pack(side="left")
+            self._engine_row2.pack(anchor="w", pady=(4, 0))
         else:  # fasterwhisper
             self._model_cb.pack(side="left")
 
@@ -509,6 +527,8 @@ class App(TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk):
         """
         self._apply_engine_view()
         self._max_chars.set(42 if self._engine_id() == "elevenlabs" else 84)
+        if self._engine_id() == "elevenlabs":
+            self._refresh_elevenlabs_quota()
 
     def _save_together_key(self):
         self._config["together_api_key"] = self._together_api_key.get().strip()
@@ -602,13 +622,61 @@ class App(TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk):
     def _save_elevenlabs_key(self):
         self._config["elevenlabs_api_key"] = self._elevenlabs_api_key.get().strip()
         _save_config(self._config)
-        self._refresh_elevenlabs_status()
+        self._elevenlabs_quota_text = ""  # 키가 바뀌었으니 캐시 무효화
+        self._refresh_elevenlabs_quota()
 
     def _refresh_elevenlabs_status(self):
+        """잔액 정보가 있으면 "키 설정됨" 대신 표시 (정보 중복 + 가로폭 절약)."""
         has_key = bool(self._elevenlabs_api_key.get().strip())
-        text = "✓ 키 설정됨" if has_key else "✗ 키 미설정"
-        color = SUCCESS if has_key else ERROR
-        self._elevenlabs_status_label.config(text=text, fg=color)
+        if not has_key:
+            self._elevenlabs_status_label.config(text="✗ 키 미설정", fg=ERROR)
+            return
+        quota = self._elevenlabs_quota_text
+        if not quota:
+            self._elevenlabs_status_label.config(text="✓ 키 설정됨", fg=SUCCESS)
+        elif quota.startswith("__fail__:"):
+            self._elevenlabs_status_label.config(text="⚠ " + quota[len("__fail__:"):], fg=ERROR)
+        else:
+            self._elevenlabs_status_label.config(text="✓ " + quota, fg=SUCCESS)
+
+    def _refresh_elevenlabs_quota(self):
+        """ElevenLabs 잔여 character를 백그라운드로 조회하고 상태 라벨에 표시."""
+        api_key = self._elevenlabs_api_key.get().strip()
+        if not api_key:
+            self._elevenlabs_quota_text = ""
+            self._refresh_elevenlabs_status()
+            return
+
+        self._elevenlabs_quota_text = "조회 중..."
+        self._refresh_elevenlabs_status()
+
+        def worker(key: str):
+            try:
+                resp = requests.get(
+                    "https://api.elevenlabs.io/v1/user/subscription",
+                    headers={"xi-api-key": key},
+                    timeout=10,
+                )
+                if resp.status_code != 200:
+                    text = f"__fail__:조회 실패 ({resp.status_code})"
+                else:
+                    data = resp.json()
+                    count = int(data.get("character_count", 0))
+                    limit = int(data.get("character_limit", 0))
+                    remaining = max(limit - count, 0)
+                    text = f"잔여 {remaining:,} / {limit:,}"
+            except Exception:
+                text = "__fail__:조회 실패"
+
+            def apply():
+                self._elevenlabs_quota_text = text
+                self._refresh_elevenlabs_status()
+            try:
+                self.after(0, apply)
+            except RuntimeError:
+                pass  # 창이 이미 닫힌 경우
+
+        threading.Thread(target=worker, args=(api_key,), daemon=True).start()
 
     def _open_elevenlabs_key_dialog(self):
         """ElevenLabs API 키 입력 모달 — 입력 → 저장 후 닫힘."""
@@ -873,6 +941,8 @@ class App(TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk):
         self._run_btn.config(state="normal", text="시작")
         self._cancel_btn.config(state="disabled", bg=BG2, fg=FG2)
         self._running = False
+        if completed and self._engine_id() == "elevenlabs":
+            self._refresh_elevenlabs_quota()
 
     def _poll_log(self):
         try:
