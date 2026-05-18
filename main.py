@@ -175,14 +175,10 @@ class App(TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk):
             v = cfg.get(key)
             return v if isinstance(v, int) and min_v <= v <= max_v else default
 
-        out_folder = cfg.get("output_folder", "")
-        if not isinstance(out_folder, str):
-            out_folder = ""
-
         self._mode = tk.StringVar(value=_pick_str("mode", MODE_GENERATE, {MODE_GENERATE, MODE_ALIGN}))
         self._media_path = tk.StringVar()
         self._srt_path = tk.StringVar()
-        self._output_folder = tk.StringVar(value=out_folder)
+        self._output_folder = tk.StringVar()
         self._language = tk.StringVar(value=_pick_str("language", "자동 감지", set(LANGUAGE_OPTIONS.keys())))
         self._engine = tk.StringVar(value=_pick_str("engine", "FasterWhisper", set(ENGINE_DISPLAY.keys())))
         self._model_size = tk.StringVar(value=_pick_str("model_size", "large-v3", set(MODEL_OPTIONS)))
@@ -708,7 +704,7 @@ class App(TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk):
         self._config["split_enabled"] = self._split_enabled.get()
         self._config["max_chars"] = self._max_chars.get()
         self._config["save_txt"] = self._save_txt.get()
-        self._config["output_folder"] = self._output_folder.get()
+        self._config.pop("output_folder", None)
         _save_config(self._config)
 
     def _on_close(self):

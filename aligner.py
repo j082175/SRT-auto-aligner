@@ -12,6 +12,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -150,13 +151,27 @@ def build_output_path(output_folder: str, input_path: str, lang_code: str) -> st
     return os.path.join(output_folder, f"{basename}.{lang_code}.srt")
 
 
+# Windows에서 subprocess 호출 시 콘솔 창이 깜빡이는 것 방지 (GUI 모드)
+_SUBPROCESS_NO_WINDOW = (
+    {"creationflags": subprocess.CREATE_NO_WINDOW}
+    if sys.platform == "win32" else {}
+)
+
+
 def extract_audio(input_path: str, output_wav: str) -> None:
-    (
+    args = (
         ffmpeg
         .input(input_path)
         .output(output_wav, ar=16000, ac=1, format="wav")
         .overwrite_output()
-        .run(quiet=True)
+        .compile()
+    )
+    subprocess.run(
+        args,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=True,
+        **_SUBPROCESS_NO_WINDOW,
     )
 
 
@@ -1023,6 +1038,7 @@ class Qwen3Engine(BaseEngine):
             encoding="utf-8",
             errors="replace",
             env=env,
+            **_SUBPROCESS_NO_WINDOW,
         )
 
         stderr_tail: List[str] = []
@@ -1247,7 +1263,7 @@ class TogetherEngine(BaseEngine):
     def _split_to_mp3_chunks(self, audio_path: str, out_dir: str) -> List[str]:
         """ffmpeg segment muxer로 N초 단위 mp3 청크 생성. 정렬된 청크 경로 리스트 반환."""
         pattern = os.path.join(out_dir, "chunk_%04d.mp3")
-        (
+        args = (
             ffmpeg
             .input(audio_path)
             .output(
@@ -1261,7 +1277,14 @@ class TogetherEngine(BaseEngine):
                 reset_timestamps=1,
             )
             .overwrite_output()
-            .run(quiet=True)
+            .compile()
+        )
+        subprocess.run(
+            args,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True,
+            **_SUBPROCESS_NO_WINDOW,
         )
         return sorted(
             os.path.join(out_dir, name)
@@ -1660,7 +1683,7 @@ class ElevenLabsScribeEngine(BaseEngine):
                     headers={"xi-api-key": api_key},
                     files={"file": (os.path.basename(audio_path), f, "audio/wav")},
                     data=form,
-                    timeout=1800,  # 장시간 영상까지 커버 (30분)
+                    timeout=7200,  # 장시간 영상까지 커버 (2시간)
                 )
         finally:
             _done.set()
